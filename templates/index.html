@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block head_extra %}<script type="application/ld+json">{{ jsonld|safe }}</script>{% endblock %}
+{% block body_attrs %} class="yt" data-fmt="{{ page.fmt }}"{% endblock %}
+{% block content %}
+<main>
+  <h1>{{ page.h1 }}</h1>
+  <p class="lede">{{ page.lede }}</p>
+
+  <form id="form" novalidate>
+    <label for="url" class="sr-only">YouTube link</label>
+    <div class="row">
+      <input type="url" inputmode="url" id="url" placeholder="Paste YouTube link here" autocomplete="off" spellcheck="false">
+      <button type="submit" id="go" class="primary">Get video</button>
+      <button type="button" id="paste" class="secondary">Paste</button>
+    </div>
+  </form>
+  <p id="status" role="status" aria-live="polite"></p>
+  <div id="result" aria-label="Result"></div>
+
+  <section class="band">
+    <h2>How it works</h2>
+    <ol class="steps">
+      <li><span><strong>Copy the link</strong>Open the video on YouTube and copy its address, or use the Share button.</span></li>
+      <li><span><strong>Paste it above</strong>Press Get video. You'll see the title, thumbnail and the qualities on offer.</span></li>
+      <li><span><strong>Pick a format and download</strong>MP4 for video, MP3 for audio only.</span></li>
+    </ol>
+    <p>{{ page.intro }}</p>
+  </section>
+
+  <section class="band">
+    <h2>What you get</h2>
+    <ul class="plain">
+      <li>No account and no watermark.</li>
+      <li>MP4 video in every quality the video has, up to 4K.</li>
+      <li>MP3 audio at 192 kbps.</li>
+      <li>Works in the browser on Windows, Mac, Android and iPhone.</li>
+      <li>Temporary files are deleted right after they're sent to you.</li>
+    </ul>
+  </section>
+
+  <section class="band">
+    <h2>Questions people ask</h2>
+    {% for q, a in faq %}<details><summary>{{ q }}</summary><p>{{ a }}</p></details>{% endfor %}
+  </section>
+</main>
+
+<script>
+(() => {
+  const form = document.getElementById('form'), field = document.getElementById('url'), goBtn = document.getElementById('go');
+  const statusEl = document.getElementById('status'), result = document.getElementById('result');
+
+  function setStatus(t, err = false) { statusEl.textContent = t; statusEl.classList.toggle('is-error', err); }
+  function el(tag, props = {}, ...kids) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(props)) { if (k === 'class') n.className = v; else if (k in n) n[k] = v; else n.setAttribute(k, v); }
+    n.append(...kids); return n;
+  }
+  function parseLink(text) {
+    const m = text.match(/(?:https?:\/\/)?(?:[\w-]+\.)*(?:youtube\.com|youtu\.be)\/[^\s"'<>]+/i);
+    return m ? m[0] : text.trim();
+  }
+  function fmtTime(s) {
+    s = Math.round(s); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+    return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(x).padStart(2, '0');
+  }
+  function filenameFrom(res, fallback) {
+    const h = res.headers.get('Content-Disposition') || '';
+    const star = h.match(/filename\*=UTF-8''([^;]+)/i);
+    if (star) { try { return decodeURIComponent(star[1]); } catch (_) {} }
+    const plain = h.match(/filename="?([^";]+)"?/i);
+    return plain ? plain[1] : fallback;
+  }
+  async function readError(res, fallback) {
+    try { const d = await res.json(); return d.error || fallback; } catch (_) { return fallback; }
+  }
+
+  function card(info) {
+    const select = el('select', { 'aria-label': 'Format and quality' });
+    info.heights.forEach(h => select.append(el('option', { value: `mp4:${h}` }, `MP4 video, up to ${h}p${h > 1080 ? ' (may need VLC)' : ''}`)));
+    select.append(el('option', { value: 'mp3:0' }, 'MP3 audio only'));
+    const pref = info.heights.includes(720) ? 'mp4:720' : `mp4:${info.heights[0]}`;
+    select.value = document.body.dataset.fmt === 'mp3' ? 'mp3:0' : pref;
+
+    const btn = el('button', { type: 'button', class: 'primary' }, 'Download');
+    const note = el('p', { class: 'note', hidden: true });
+    btn.addEventListener('click', async () => {
+      const [fmt, height] = select.value.split(':');
+      btn.disabled = select.disabled = true; btn.textContent = 'Preparing…';
+      note.className = 'note'; note.hidden = false;
+      note.textContent = 'The server is fetching your file. Long or HD videos can take a minute or two.';
+      try {
+        const res = await fetch(`/download?id=${encodeURIComponent(info.id)}&fmt=${fmt}&height=${height}`);
+        if (!res.ok) throw new Error(await readError(res, 'Download failed. Please try again.'));
+        const total = +res.headers.get('Content-Length') || 0, reader = res.body.getReader(), parts = []; let got = 0;
+        for (;;) {
+          const { done, value } = await reader.read(); if (done) break;
+          parts.push(value); got += value.length;
+          if (total) btn.textContent = `Downloading ${Math.round(got / total * 100)}%`;
+        }
+        const a = el('a', { href: URL.createObjectURL(new Blob(parts)), download: filenameFrom(res, `${info.id}.${fmt}`) });
+        document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 15000);
+        btn.textContent = 'Saved. Download again'; note.textContent = 'Done. Check your Downloads folder.';
+      } catch (e) {
+        btn.textContent = 'Download'; note.textContent = e.message || 'Download failed.'; note.classList.add('is-error');
+      } finally { btn.disabled = select.disabled = false; }
+    });
+
+    const meta = [info.channel, info.duration ? fmtTime(info.duration) : ''].filter(Boolean).join(' · ');
+    return el('article', { class: 'card' },
+      el('img', { src: info.thumbnail || '', alt: '', referrerPolicy: 'no-referrer' }),
+      el('div', {}, el('p', { class: 'title' }, info.title), el('p', { class: 'meta' }, meta), select, btn, note));
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const url = parseLink(field.value);
+    if (!url) { setStatus('Paste a YouTube link first.', true); field.focus(); return; }
+    goBtn.disabled = true; goBtn.textContent = 'Looking up…'; result.replaceChildren();
+    setStatus('Looking up the video. This can take up to a minute if the server was asleep.');
+    try {
+      const res = await fetch('/api/info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
+      if (!res.ok) throw new Error(await readError(res, `The server is busy or waking up (code ${res.status}). Please try again in a minute.`));
+      const data = await res.json();
+      setStatus(''); result.append(card(data));
+      result.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    } catch (err) { setStatus(err.message || "Couldn't reach the server. Check your connection and try again.", true); }
+    finally { goBtn.disabled = false; goBtn.textContent = 'Get video'; }
+  });
+
+  document.getElementById('paste').addEventListener('click', async () => {
+    try { field.value = await navigator.clipboard.readText(); form.requestSubmit(); }
+    catch (_) { setStatus('Your browser blocked clipboard access. Paste with Ctrl+V (or long-press) instead.', true); field.focus(); }
+  });
+})();
+</script>
+{% endblock %}
