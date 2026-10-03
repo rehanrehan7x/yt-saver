@@ -31,3 +31,10 @@ Instagram
 - Public reels, photos and profile pictures only. Instagram often blocks cloud servers.
 - Optional: export an Instagram cookies.txt from a spare account, add it as a Render Secret File and set
   IG_COOKIES_FILE=/etc/secrets/ig_cookies.txt. Use a throwaway account; Instagram may restrict it.
+
+Making Instagram reliable on Render
+- The app first tries several no-login methods. If Instagram still blocks the server, add ONE of:
+  1) Cookies from a spare Instagram account: Render > Environment > Secret Files > ig_cookies.txt,
+     then env var IG_COOKIES_FILE=/etc/secrets/ig_cookies.txt
+  2) A residential proxy: env var IG_PROXY=http://user:pass@host:port (paid service)
+- Private accounts: only the profile picture can be saved. Their posts cannot.
