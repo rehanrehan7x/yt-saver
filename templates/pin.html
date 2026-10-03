@@ -1,0 +1,248 @@
+{% extends "base.html" %}
+{% block head_extra %}<meta name="referrer" content="no-referrer"><script type="application/ld+json">{{ jsonld|safe }}</script>{% endblock %}
+{% block body_attrs %} class="pin"{% endblock %}
+{% block content %}
+<main>
+  <h1>{{ page.h1 }}</h1>
+  <p class="lede">{{ page.lede }}</p>
+
+  <form id="form" novalidate>
+    <label for="urls" class="sr-only">Pinterest pin links</label>
+    <textarea id="urls" autocomplete="off" spellcheck="false" placeholder="Paste Pinterest link(s) here, e.g. https://www.pinterest.com/pin/1234567890/"></textarea>
+    <div class="actions">
+      <button type="submit" id="go" class="primary">Find media</button>
+      <button type="button" id="paste" class="secondary">Paste from clipboard</button>
+      <button type="button" id="clear" class="secondary" hidden>Clear</button>
+      <span class="link-count" id="count">pin.it short links work too. Up to 20 at a time.</span>
+    </div>
+  </form>
+
+  <p id="status" role="status" aria-live="polite"></p>
+  <div id="toolbar" hidden><button type="button" id="all" class="secondary"></button></div>
+  <section id="results" class="board" aria-label="Results"></section>
+
+  <section class="band">
+    <h2>How it works</h2>
+    <ol class="steps">
+      <li><span><strong>Copy the pin's link</strong>Open the pin, press Share, copy the link. pin.it links are fine.</span></li>
+      <li><span><strong>Paste it above</strong>You can paste several links at once, then press Find media.</span></li>
+      <li><span><strong>Press Download</strong>Photos come as the biggest size, videos as MP4, GIFs as real .gif files.</span></li>
+    </ol>
+    <p>{{ page.intro }}</p>
+  </section>
+
+  <section class="band">
+    <h2>Questions people ask</h2>
+    {% for q, a in faq %}<details><summary>{{ q }}</summary><p>{{ a }}</p></details>{% endfor %}
+  </section>
+</main>
+<script>
+    const form = document.getElementById('form');
+    const field = document.getElementById('urls');
+    const goBtn = document.getElementById('go');
+    const statusEl = document.getElementById('status');
+    const board = document.getElementById('results');
+    const toolbar = document.getElementById('toolbar');
+    const allBtn = document.getElementById('all');
+
+    let found = []; // successful lookups, each with a .button element
+
+    function setStatus(text, isError = false) {
+      statusEl.textContent = text;
+      statusEl.classList.toggle('is-error', isError);
+    }
+
+    function el(tag, props = {}, ...children) {
+      const node = document.createElement(tag);
+      for (const [key, value] of Object.entries(props)) {
+        if (key === 'class') node.className = value;
+        else if (key in node) node[key] = value;
+        else node.setAttribute(key, value);
+      }
+      node.append(...children);
+      return node;
+    }
+
+    function plural(n, word) { return `${n} ${word}${n === 1 ? '' : 's'}`; }
+
+    function okCard(item, index) {
+      const print = el('div', { class: 'print' });
+      if (item.thumbnail) {
+        const img = el('img', { src: item.thumbnail, alt: item.title, loading: 'lazy', referrerPolicy: 'no-referrer' });
+        img.addEventListener('error', () => { img.style.minHeight = '140px'; img.removeAttribute('src'); });
+        print.append(img);
+      }
+      print.append(el('span', { class: 'kind' }, item.kind === 'video' ? 'Video' : item.kind === 'gif' ? 'GIF' : 'Photo'));
+
+      const button = el('button', { type: 'button', class: 'primary' }, 'Download');
+      const note = el('p', { class: 'note', hidden: true });
+      button.addEventListener('click', () => saveItem(item));
+      item.button = button;
+      item.note = note;
+
+      const caption = el('div', { class: 'caption' },
+        el('p', { class: 'title' }, item.title),
+        el('p', { class: 'file' }, item.filename),
+        button, note,
+        el('a', { class: 'view', href: item.url, target: '_blank', rel: 'noopener noreferrer' }, 'Open pin on Pinterest'));
+      return el('article', { class: 'card', style: `--i:${index}` }, print, caption);
+    }
+
+    function retryButton(item) {
+      const b = el('button', { type: 'button', class: 'secondary' }, 'Try again');
+      b.addEventListener('click', async () => {
+        b.disabled = true; b.textContent = 'Trying…';
+        try {
+          const data = await (await fetch('/api/pin/lookup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ urls: [item.input] }) })).json();
+          const res = data.results[0];
+          const card = b.closest('.card');
+          card.replaceWith(res.ok ? okCard(res, 0) : errorCard(res, 0));
+          if (res.ok) { found.push(res); updateToolbar(); }
+        } catch (_) { b.disabled = false; b.textContent = 'Try again'; }
+      });
+      return b;
+    }
+
+    function updateToolbar() {
+      toolbar.hidden = found.length < 2;
+      allBtn.textContent = `Download all ${found.length}`;
+    }
+
+    // Pull pin links out of any pasted text (messages, share text, one per line or not).
+    function parseLinks(text) {
+      const re = /(?:https?:\/\/)?(?:[\w-]+\.)*(?:pinterest\.[a-z.]{2,6}\/pin\/|pin\.it\/)[^\s"'<>,]+/gi;
+      const hits = text.match(re) || text.split(/[\s,]+/).filter(Boolean);
+      return [...new Set(hits)];
+    }
+
+    function errorCard(item, index) {
+      return el('article', { class: 'card', style: `--i:${index}` },
+        el('div', { class: 'print failed' },
+          el('p', { class: 'msg' }, item.error || "This link couldn't be read."),
+          el('p', { class: 'src' }, item.input),
+          retryButton(item)));
+    }
+
+    function filenameFrom(response, fallback) {
+      const header = response.headers.get('Content-Disposition') || '';
+      const match = header.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+      return match ? decodeURIComponent(match[1]) : fallback;
+    }
+
+    async function saveItem(item) {
+      const { button, note } = item;
+      button.disabled = true;
+      button.textContent = 'Preparing…';
+      note.hidden = true;
+      try {
+        const response = await fetch('/pin/download?url=' + encodeURIComponent(item.url));
+        if (!response.ok) {
+          let message = 'Download failed. Try again.';
+          try { message = (await response.json()).error || message; } catch (_) {}
+          throw new Error(message);
+        }
+        const total = +response.headers.get('Content-Length') || 0;
+        const reader = response.body.getReader();
+        const parts = []; let got = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          parts.push(value); got += value.length;
+          if (total) button.textContent = `Downloading ${Math.round(got / total * 100)}%`;
+        }
+        const blob = new Blob(parts);
+        const link = el('a', { href: URL.createObjectURL(blob), download: filenameFrom(response, item.filename) });
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(link.href), 15000);
+        button.textContent = 'Saved. Download again';
+        return true;
+      } catch (err) {
+        button.textContent = 'Download';
+        note.textContent = err.message;
+        note.hidden = false;
+        return false;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function render(results) {
+      board.replaceChildren();
+      found = results.filter(r => r.ok);
+      results.forEach((item, i) => board.append(item.ok ? okCard(item, i) : errorCard(item, i)));
+
+      const failed = results.length - found.length;
+      if (!found.length) setStatus("None of those links could be read.", true);
+      else if (failed) setStatus(`Found ${plural(found.length, 'file')}. ${plural(failed, 'link')} couldn't be read.`);
+      else setStatus(`Found ${plural(found.length, 'file')}.`);
+
+      updateToolbar();
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const urls = parseLinks(field.value);
+      if (!urls.length) {
+        setStatus('Paste at least one pin link.', true);
+        field.focus();
+        return;
+      }
+      goBtn.disabled = true;
+      board.replaceChildren();
+      toolbar.hidden = true;
+      setStatus(`Looking up ${plural(urls.length, 'link')}…`);
+      urls.slice(0, 6).forEach(() => board.append(el('article', { class: 'card' }, el('div', { class: 'print' }, el('div', { class: 'skeleton' })))));
+      try {
+        const response = await fetch('/api/pin/lookup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ urls }),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Lookup failed.');
+        render(data.results);
+      } catch (err) {
+        setStatus(err.message || "Couldn't reach the app. Is it still running?", true);
+      } finally {
+        goBtn.disabled = false;
+      }
+    });
+
+    const countEl = document.getElementById('count');
+    const clearBtn = document.getElementById('clear');
+    field.addEventListener('input', () => {
+      const n = field.value.trim() ? parseLinks(field.value).length : 0;
+      countEl.textContent = n ? `${plural(n, 'link')} ready` : 'pin.it short links work too. Up to 20 at a time.';
+      clearBtn.hidden = !field.value;
+    });
+    clearBtn.addEventListener('click', () => {
+      field.value = ''; field.dispatchEvent(new Event('input'));
+      board.replaceChildren(); toolbar.hidden = true; setStatus(''); field.focus();
+    });
+    document.getElementById('paste').addEventListener('click', async () => {
+      try {
+        field.value = await navigator.clipboard.readText();
+        field.dispatchEvent(new Event('input'));
+        if (parseLinks(field.value).length) form.requestSubmit();
+      } catch (_) {
+        setStatus('Your browser blocked clipboard access. Paste with Ctrl+V (or long-press) instead.', true);
+        field.focus();
+      }
+    });
+
+    field.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) form.requestSubmit();
+    });
+
+    allBtn.addEventListener('click', async () => {
+      allBtn.disabled = true;
+      for (const item of found) {
+        await saveItem(item);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      allBtn.disabled = false;
+    });
+  </script>
+{% endblock %}
