@@ -40,19 +40,33 @@ LOGIN_MSG = ("Instagram is limiting our server right now, so we couldn't fetch t
              "Please try again in a few minutes. Private posts can't be downloaded.")
 
 
+def _load_cookie_rows(path: str) -> list[tuple]:
+    """Parse a Netscape cookies.txt ourselves (keeps #HttpOnly_ cookies like sessionid)."""
+    rows = []
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#HttpOnly_"):
+                    line = line[len("#HttpOnly_"):]
+                elif not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    rows.append((parts[0], parts[2], parts[5], parts[6], parts[4]))  # domain, path, name, value, expiry
+    except OSError:
+        pass
+    return rows
+
+
 def _session() -> requests.Session:
     sess = requests.Session()
     sess.headers.update({"User-Agent": DESKTOP_UA, "Accept-Language": "en-US,en;q=0.9"})
     if PROXY:
         sess.proxies = {"http": PROXY, "https": PROXY}
     if COOKIES:
-        try:
-            from http.cookiejar import MozillaCookieJar
-            jar = MozillaCookieJar(COOKIES)
-            jar.load(ignore_discard=True, ignore_expires=True)
-            sess.cookies.update(jar)
-        except Exception:  # noqa: BLE001
-            log.warning("Could not load Instagram cookies")
+        for domain, path, name, value, _exp in _load_cookie_rows(COOKIES):
+            sess.cookies.set(name, value, domain=domain, path=path)
     return sess
 
 
@@ -161,18 +175,25 @@ def _fetch_html(url: str) -> BeautifulSoup:
     return BeautifulSoup(_get_text(url, BOT_UA), "html.parser")
 
 
-def _api_get(url: str, params=None, ua: str = APP_UA, extra=None):
-    """GET an Instagram JSON endpoint with our session. Returns (status, data) and logs the HTTP code."""
+def _request(url: str, params=None, ua: str = APP_UA, extra=None, web: bool = False):
     sess = _session()
-    headers = {"User-Agent": ua, "x-ig-app-id": "936619743392459", "Accept": "*/*"}
+    headers = {"User-Agent": DESKTOP_UA if web else ua, "x-ig-app-id": "936619743392459", "Accept": "*/*"}
     token = sess.cookies.get("csrftoken")
     if token:
         headers["x-csrftoken"] = token
+    if web:  # match what instagram.com itself sends, so web cookies are accepted
+        headers.update({"x-requested-with": "XMLHttpRequest", "x-asbd-id": "129477",
+                        "x-ig-www-claim": "0", "referer": "https://www.instagram.com/"})
     if extra:
         headers.update(extra)
+    return sess.get(url, params=params, headers=headers, timeout=12)
+
+
+def _api_get(url: str, params=None, ua: str = APP_UA, extra=None, web: bool = False):
+    """GET an Instagram JSON endpoint. Returns (status, data) and logs the HTTP code."""
     short = url.split("?")[0].replace("https://", "")
     try:
-        r = sess.get(url, params=params, headers=headers, timeout=12)
+        r = _request(url, params, ua, extra, web)
     except requests.RequestException as exc:
         log.warning("IG api %s failed: %r", short, exc)
         return None, None
@@ -199,8 +220,12 @@ def _api_media(kind: str, code: str) -> list[Media]:
         media_id = _shortcode_to_id(code)
     except ValueError:
         return []
-    status, data = _api_get(f"https://i.instagram.com/api/v1/media/{media_id}/info/")
-    items = (data or {}).get("items") or []
+    status, items = None, []
+    for host, web in (("www.instagram.com", True), ("i.instagram.com", False)):
+        status, data = _api_get(f"https://{host}/api/v1/media/{media_id}/info/", web=web)
+        items = (data or {}).get("items") or []
+        if items or status == 404:
+            break
     if not items:
         if status == 404:
             raise IGError("This post isn't available. It may be private or deleted.", 404)
@@ -368,13 +393,11 @@ def _resolve_post(kind: str, code: str) -> IGInfo:
 
 def _resolve_profile(username: str) -> IGInfo:
     pic, name, uid = None, "", None
-    attempts = [
-        ("https://i.instagram.com/api/v1/users/web_profile_info/", APP_UA, {}),
-        ("https://www.instagram.com/api/v1/users/web_profile_info/", DESKTOP_UA,
-         {"x-requested-with": "XMLHttpRequest", "referer": f"https://www.instagram.com/{username}/"}),
-    ]
-    for url, ua, extra in attempts:
-        status, data = _api_get(url, {"username": username}, ua, extra)
+    attempts = [("https://www.instagram.com/api/v1/users/web_profile_info/", True,
+                 {"referer": f"https://www.instagram.com/{username}/"}),
+                ("https://i.instagram.com/api/v1/users/web_profile_info/", False, {})]
+    for url, web, extra in attempts:
+        status, data = _api_get(url, {"username": username}, extra=extra, web=web)
         if status == 404:
             raise IGError("No Instagram account with that username.", 404)
         user = ((data or {}).get("data") or {}).get("user") or {}
@@ -384,10 +407,12 @@ def _resolve_profile(username: str) -> IGInfo:
             uid = user.get("id") or user.get("pk")
             break
     if uid and COOKIES:  # try for the full-size picture
-        _, data = _api_get(f"https://i.instagram.com/api/v1/users/{uid}/info/")
-        hd = (((data or {}).get("user") or {}).get("hd_profile_pic_url_info") or {}).get("url")
-        if hd:
-            pic = hd
+        for host, web in (("www.instagram.com", True), ("i.instagram.com", False)):
+            _, data = _api_get(f"https://{host}/api/v1/users/{uid}/info/", web=web)
+            hd = (((data or {}).get("user") or {}).get("hd_profile_pic_url_info") or {}).get("url")
+            if hd:
+                pic = hd
+                break
     if not pic:  # public embed page of the profile
         try:
             html = _get_text(f"https://www.instagram.com/{username}/embed/", DESKTOP_UA)
@@ -473,3 +498,45 @@ def download_item(info: IGInfo, index: int, out_dir: str) -> str:
     if not files:
         raise IGError("Couldn't download this video.", 502)
     return max(files, key=os.path.getsize)
+
+
+def _cookie_status() -> dict:
+    rows = _load_cookie_rows(COOKIES) if COOKIES else []
+    names = sorted({r[2] for r in rows})
+    return {"file_loaded": bool(COOKIES), "cookie_count": len(rows), "names": names,
+            "has_sessionid": "sessionid" in names, "has_csrftoken": "csrftoken" in names,
+            "has_ds_user_id": "ds_user_id" in names}
+
+
+def debug_report(raw: str) -> dict:
+    """Shows which step fails and why. Never prints cookie values."""
+    rep = {"cookies": _cookie_status(), "proxy_set": bool(PROXY), "probes": []}
+
+    def probe(label, url, **kw):
+        try:
+            r = _request(url, **kw)
+            text = r.text or ""
+            entry = {"step": label, "http": r.status_code, "bytes": len(text), "start": re.sub(r"\s+", " ", text[:160])}
+            if "embed" in label:
+                entry["has_media_keys"] = {k: (k in text) for k in ("contextJSON", "video_url", "display_url", "profile_pic_url")}
+        except requests.RequestException as exc:
+            entry = {"step": label, "error": repr(exc)[:160]}
+        rep["probes"].append(entry)
+
+    kind, ident = parse_input(raw)
+    if kind == "post":
+        k, code = ident
+        try:
+            mid = _shortcode_to_id(code)
+            probe("web media api", f"https://www.instagram.com/api/v1/media/{mid}/info/", web=True)
+            probe("app media api", f"https://i.instagram.com/api/v1/media/{mid}/info/")
+        except ValueError:
+            rep["probes"].append({"step": "media api", "error": "bad shortcode"})
+        probe("embed page", f"https://www.instagram.com/{'reel' if k == 'reel' else 'p'}/{code}/embed/captioned/", ua=DESKTOP_UA, web=True)
+        probe("preview page (og)", f"https://www.instagram.com/{k}/{code}/", ua=BOT_UA)
+    else:
+        probe("web profile api", "https://www.instagram.com/api/v1/users/web_profile_info/", params={"username": ident}, web=True)
+        probe("app profile api", "https://i.instagram.com/api/v1/users/web_profile_info/", params={"username": ident})
+        probe("profile embed page", f"https://www.instagram.com/{ident}/embed/", ua=DESKTOP_UA, web=True)
+        probe("preview page (og)", f"https://www.instagram.com/{ident}/", ua=BOT_UA)
+    return rep
