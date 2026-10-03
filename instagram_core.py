@@ -32,6 +32,10 @@ PROXY = os.environ.get("IG_PROXY") or None  # e.g. http://user:pass@host:port (o
 DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/120.0 Safari/537.36")
 
+APP_UA = ("Instagram 275.0.0.27.98 Android (33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; "
+          "exynos2100; en_US; 458229237)")
+ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
 LOGIN_MSG = ("Instagram is limiting our server right now, so we couldn't fetch this. "
              "Please try again in a few minutes. Private posts can't be downloaded.")
 
@@ -157,6 +161,64 @@ def _fetch_html(url: str) -> BeautifulSoup:
     return BeautifulSoup(_get_text(url, BOT_UA), "html.parser")
 
 
+def _api_get(url: str, params=None, ua: str = APP_UA, extra=None):
+    """GET an Instagram JSON endpoint with our session. Returns (status, data) and logs the HTTP code."""
+    sess = _session()
+    headers = {"User-Agent": ua, "x-ig-app-id": "936619743392459", "Accept": "*/*"}
+    token = sess.cookies.get("csrftoken")
+    if token:
+        headers["x-csrftoken"] = token
+    if extra:
+        headers.update(extra)
+    short = url.split("?")[0].replace("https://", "")
+    try:
+        r = sess.get(url, params=params, headers=headers, timeout=12)
+    except requests.RequestException as exc:
+        log.warning("IG api %s failed: %r", short, exc)
+        return None, None
+    log.warning("IG api %s -> HTTP %s", short, r.status_code)
+    try:
+        return r.status_code, (r.json() if r.status_code == 200 else None)
+    except ValueError:
+        return r.status_code, None
+
+
+def _shortcode_to_id(code: str) -> int:
+    code = code[:11] if len(code) > 28 else code
+    n = 0
+    for ch in code:
+        n = n * 64 + ALPHABET.index(ch)
+    return n
+
+
+def _api_media(kind: str, code: str) -> list[Media]:
+    """Logged-in method (needs cookies): works for photos, carousels and videos."""
+    if not COOKIES:
+        return []
+    try:
+        media_id = _shortcode_to_id(code)
+    except ValueError:
+        return []
+    status, data = _api_get(f"https://i.instagram.com/api/v1/media/{media_id}/info/")
+    items = (data or {}).get("items") or []
+    if not items:
+        if status == 404:
+            raise IGError("This post isn't available. It may be private or deleted.", 404)
+        return []
+    item = items[0]
+    nodes = item.get("carousel_media") or [item]
+    out = []
+    for i, n in enumerate(nodes):
+        suffix = f"_{i + 1}" if len(nodes) > 1 else ""
+        video = ((n.get("video_versions") or [{}])[0]).get("url")
+        image = (((n.get("image_versions2") or {}).get("candidates") or [{}])[0]).get("url")
+        if video:
+            out.append(Media("video", image, f"{code}{suffix}.mp4", video, "Reel" if kind == "reel" else "Video", "og", i))
+        elif image:
+            out.append(Media("image", image, f"{code}{suffix}.jpg", image, "Photo", "og", i))
+    return out
+
+
 def _unescape(v: str) -> str:
     for _ in range(3):
         v = v.replace("\\\\", "\\")
@@ -275,7 +337,7 @@ def _embed_media(kind: str, code: str) -> list[Media]:
 
 def _resolve_post(kind: str, code: str) -> IGInfo:
     # With a logged-in cookie or proxy, yt-dlp is the most reliable; otherwise try the no-login methods first.
-    steps = [_ytdlp_media, _embed_media, _og_media] if (COOKIES or PROXY) else [_embed_media, _og_media, _ytdlp_media]
+    steps = [_api_media, _ytdlp_media, _embed_media, _og_media] if (COOKIES or PROXY) else [_embed_media, _og_media, _ytdlp_media]
     media: list[Media] = []
     errors: list[IGError] = []
     deadline = time.time() + LOOKUP_BUDGET
@@ -305,25 +367,27 @@ def _resolve_post(kind: str, code: str) -> IGInfo:
 
 
 def _resolve_profile(username: str) -> IGInfo:
-    pic, name = None, ""
-    try:
-        sess = _session()
-        headers = {"User-Agent": WEB_UA, "x-ig-app-id": "936619743392459"}
-        token = sess.cookies.get("csrftoken")
-        if token:
-            headers["x-csrftoken"] = token
-        r = sess.get("https://i.instagram.com/api/v1/users/web_profile_info/", params={"username": username},
-                     headers=headers, timeout=12)
-        if r.status_code == 404:
+    pic, name, uid = None, "", None
+    attempts = [
+        ("https://i.instagram.com/api/v1/users/web_profile_info/", APP_UA, {}),
+        ("https://www.instagram.com/api/v1/users/web_profile_info/", DESKTOP_UA,
+         {"x-requested-with": "XMLHttpRequest", "referer": f"https://www.instagram.com/{username}/"}),
+    ]
+    for url, ua, extra in attempts:
+        status, data = _api_get(url, {"username": username}, ua, extra)
+        if status == 404:
             raise IGError("No Instagram account with that username.", 404)
-        if r.status_code == 200:
-            user = (r.json().get("data") or {}).get("user") or {}
+        user = ((data or {}).get("data") or {}).get("user") or {}
+        if user:
             pic = user.get("profile_pic_url_hd") or user.get("profile_pic_url")
             name = user.get("full_name") or ""
-    except IGError:
-        raise
-    except (requests.RequestException, ValueError):
-        pass
+            uid = user.get("id") or user.get("pk")
+            break
+    if uid and COOKIES:  # try for the full-size picture
+        _, data = _api_get(f"https://i.instagram.com/api/v1/users/{uid}/info/")
+        hd = (((data or {}).get("user") or {}).get("hd_profile_pic_url_info") or {}).get("url")
+        if hd:
+            pic = hd
     if not pic:  # public embed page of the profile
         try:
             html = _get_text(f"https://www.instagram.com/{username}/embed/", DESKTOP_UA)
