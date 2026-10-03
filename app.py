@@ -530,6 +530,17 @@ def ig_download():
     return resp
 
 
+@app.errorhandler(Exception)
+def handle_any(exc):
+    from werkzeug.exceptions import HTTPException
+    if isinstance(exc, HTTPException):
+        return exc
+    app.logger.exception("Unhandled error")
+    if request.path.startswith(("/api/", "/ig/", "/pin/", "/download")):
+        return jsonify(error="Something went wrong on the server. Please try again."), 500
+    return "Server error", 500
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     host = os.environ.get("HOST", "127.0.0.1")
