@@ -1,495 +1,122 @@
-"""
-Core logic for finding and downloading the original photo or video behind a
-Pinterest pin. Adapted from pinterest_downloader.py, reworked so a web app can
-call it (no printing, structured errors, safer URL handling).
-"""
-
+"""Instagram helper: public reels / videos / photos and profile pictures."""
 from __future__ import annotations
 
-import glob
-import json
-import logging
-import os
-import re
-import shutil
-import threading
-import time
-from dataclasses import asdict, dataclass, field
-from urllib.parse import urljoin, urlparse
+import glob, json, logging, os, re, shutil, tempfile, threading, time
+from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 import requests
+import yt_dlp
 from bs4 import BeautifulSoup
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
+log = logging.getLogger("igsaver")
 
-# Only talk to Pinterest's own domains (www.pinterest.com, in.pinterest.com,
-# pinterest.co.uk, ...), its short-link domain, and its image/video CDN.
-PINTEREST_HOST = re.compile(r"^(?:[a-z0-9-]+\.)*pinterest\.[a-z]{2,3}(?:\.[a-z]{2})?$", re.I)
-SHORT_HOST = "pin.it"
-CDN_HOST = re.compile(r"^(?:[a-z0-9-]+\.)*pinimg\.com$", re.I)
-PIN_ID = re.compile(r"/pin/(?:[^/?#]*?--)?(\d+)")
+BOT_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
+WEB_UA = ("Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/120.0 Mobile Safari/537.36")
+CDN_HOST = re.compile(r"(?:^|\.)(?:cdninstagram\.com|fbcdn\.net)$", re.I)
+IG_HOST = re.compile(r"^(?:www\.|m\.)?(?:instagram\.com|instagr\.am)$", re.I)
+USERNAME = re.compile(r"^@?([A-Za-z0-9._]{1,30})$")
+CODE = re.compile(r"^[\w-]{5,30}$")
+IMG_EXT = {"jpg", "jpeg", "png", "webp"}
+MAX_BYTES = 500 * 1024 * 1024
 
-CACHE_TTL_SECONDS = 600
+COOKIES = None
+_src = os.environ.get("IG_COOKIES_FILE")
+if _src and os.path.isfile(_src):
+    COOKIES = os.path.join(tempfile.gettempdir(), "ig_cookies.txt")
+    shutil.copyfile(_src, COOKIES)
 
-log = logging.getLogger("pinsaver")
+LOOKUP_BUDGET = 40  # seconds for one whole lookup (Render cuts requests off near 100s)
+PROXY = os.environ.get("IG_PROXY") or None  # e.g. http://user:pass@host:port (optional)
+DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/120.0 Safari/537.36")
+
+LOGIN_MSG = ("Instagram is limiting our server right now, so we couldn't fetch this. "
+             "Please try again in a few minutes. Private posts can't be downloaded.")
 
 
-class PinError(Exception):
-    """An error with a message that is safe to show to the user."""
+def _session() -> requests.Session:
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": DESKTOP_UA, "Accept-Language": "en-US,en;q=0.9"})
+    if PROXY:
+        sess.proxies = {"http": PROXY, "https": PROXY}
+    if COOKIES:
+        try:
+            from http.cookiejar import MozillaCookieJar
+            jar = MozillaCookieJar(COOKIES)
+            jar.load(ignore_discard=True, ignore_expires=True)
+            sess.cookies.update(jar)
+        except Exception:  # noqa: BLE001
+            log.warning("Could not load Instagram cookies")
+    return sess
 
+
+class IGError(Exception):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
         self.status = status
 
 
 @dataclass
-class PinInfo:
-    pin_id: str
-    url: str
-    kind: str  # "image", "gif" or "video"
-    title: str
+class Media:
+    kind: str            # "video", "image" or "dp"
     thumbnail: str | None
     filename: str
-    image_urls: list[str] = field(default_factory=list)
-    video_urls: list[str] = field(default_factory=list)  # direct .mp4 files, best first
-    hls_urls: list[str] = field(default_factory=list)    # .m3u8 streams (fallback)
+    url: str | None      # direct CDN url when known
+    label: str
+    via: str             # "ytdlp", "og" or "api"
+    index: int = 0
+
+
+@dataclass
+class IGInfo:
+    key: str
+    kind: str            # "post" or "profile"
+    title: str
+    canonical: str
+    media: list[Media] = field(default_factory=list)
+    post_url: str = ""
 
     def public(self) -> dict:
-        """The fields the browser needs (no internal candidate lists)."""
-        d = asdict(self)
-        for internal in ("image_urls", "video_urls", "hls_urls"):
-            d.pop(internal)
-        return d
+        return {"title": self.title, "kind": self.kind, "canonical": self.canonical,
+                "items": [{"index": m.index, "kind": m.kind, "label": m.label, "thumbnail": m.thumbnail,
+                           "filename": m.filename} for m in self.media]}
 
 
-# --------------------------------------------------------------------------
-# URL handling
-# --------------------------------------------------------------------------
-
-def _host(url: str) -> str:
-    return (urlparse(url).hostname or "").lower()
-
-
-def _is_pinterest(url: str) -> bool:
-    host = _host(url)
-    return bool(PINTEREST_HOST.match(host)) or host == SHORT_HOST
-
-
-def _follow_short_link(url: str) -> str:
-    """Resolve pin.it links, checking every redirect hop stays on Pinterest."""
-    current = url
-    for _ in range(5):
-        try:
-            resp = requests.get(current, headers=HEADERS, allow_redirects=False,
-                                timeout=15, stream=True)
-            resp.close()
-        except requests.RequestException:
-            raise PinError("Couldn't open that short link. Check your connection and try again.", 502)
-        location = resp.headers.get("Location")
-        if 300 <= resp.status_code < 400 and location:
-            nxt = urljoin(current, location)
-            if not _is_pinterest(nxt):
-                raise PinError("That short link doesn't lead to a Pinterest pin.")
-            current = nxt
-            if _host(current) != SHORT_HOST and PIN_ID.search(urlparse(current).path):
-                return current
-            continue
-        return current
-    raise PinError("That short link redirects too many times.")
-
-
-def resolve_pin_url(raw: str) -> tuple[str, str]:
-    """Validate user input. Returns (canonical_pin_url, pin_id)."""
+def parse_input(raw: str):
+    """Return ("post", (kind, code)) or ("profile", username)."""
     raw = (raw or "").strip()
     if not raw:
-        raise PinError("Paste a Pinterest pin link.")
-    if not re.match(r"^https?://", raw, re.I):
-        raw = "https://" + raw
-    if not _is_pinterest(raw):
-        raise PinError("That isn't a Pinterest link.")
-
-    url = _follow_short_link(raw) if _host(raw) == SHORT_HOST else raw
-    match = PIN_ID.search(urlparse(url).path)
-    if not match:
-        raise PinError("That link doesn't point to a single pin. Open the pin and copy its address.")
-    pin_id = match.group(1)
-    return f"https://www.pinterest.com/pin/{pin_id}/", pin_id
-
-
-def upscale_image_url(url: str) -> str:
-    """Rewrite Pinterest's resized path segment (/236x/, /736x/ ...) to /originals/."""
-    if not CDN_HOST.match(_host(url)):
-        return url
-    return re.sub(r"/\d+x(?:\d+)?/", "/originals/", url, count=1)
-
-
-# --------------------------------------------------------------------------
-# Page parsing
-# --------------------------------------------------------------------------
-
-def fetch_html(url: str) -> str:
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-    except requests.Timeout:
-        raise PinError("Pinterest took too long to respond. Try again in a moment.", 504)
-    except requests.RequestException:
-        raise PinError("Couldn't reach Pinterest. Check your internet connection.", 502)
-    if resp.status_code == 404:
-        raise PinError("Pin not found. It may have been deleted or made private.", 404)
-    if resp.status_code in (403, 429):
-        raise PinError("Pinterest is limiting requests right now. Wait a minute and try again.", 429)
-    if not resp.ok:
-        raise PinError(f"Pinterest returned an error ({resp.status_code}).", 502)
-    return resp.text
+        raise IGError("Paste an Instagram link or a username.")
+    if re.match(r"^(?:https?://)?(?:www\.|m\.)?(?:instagram\.com|instagr\.am)/", raw, re.I):
+        if not raw.lower().startswith("http"):
+            raw = "https://" + raw
+        u = urlparse(raw)
+        if not IG_HOST.match(u.hostname or ""):
+            raise IGError("That isn't an Instagram link.")
+        parts = [p for p in u.path.split("/") if p]
+        if not parts:
+            raise IGError("Paste the link of a post, reel or profile.")
+        if parts[0].lower() == "stories":
+            raise IGError("Stories aren't supported. Paste a post, reel or profile link.")
+        for i, p in enumerate(parts):
+            if p.lower() in ("p", "reel", "reels", "tv") and i + 1 < len(parts):
+                code = parts[i + 1]
+                if not CODE.match(code):
+                    raise IGError("That post link looks incomplete.")
+                kind = "reel" if p.lower() in ("reel", "reels") else ("tv" if p.lower() == "tv" else "p")
+                return "post", (kind, code)
+        if len(parts) == 1 and USERNAME.match(parts[0]) and parts[0].lower() not in ("explore", "accounts", "direct", "about", "legal"):
+            return "profile", parts[0].lower()
+        raise IGError("Paste the link of a post, reel or profile.")
+    m = USERNAME.match(raw)
+    if m:
+        return "profile", m.group(1).lower()
+    raise IGError("That doesn't look like an Instagram link or username.")
 
 
-def _json_blobs(soup: BeautifulSoup):
-    """Yield every JSON blob embedded in the page's <script> tags."""
-    for tag in soup.find_all("script"):
-        looks_like_json = (
-            tag.get("type") == "application/json"
-            or tag.get("id") in ("__PWS_DATA__", "initial-state")
-        )
-        if not looks_like_json:
-            continue
-        text = tag.string or tag.get_text()
-        if not text:
-            continue
-        try:
-            yield json.loads(text)
-        except ValueError:
-            continue
-
-
-def find_pin_objects(data, pin_id: str) -> list[dict]:
-    """
-    Find every dict describing *this* pin (matching id, with media fields).
-
-    The page JSON also contains related pins, so we must match on the pin id
-    rather than grabbing the first URL we see.
-    """
-    found: list[dict] = []
-    stack = [data]
-    while stack:
-        cur = stack.pop()
-        if isinstance(cur, dict):
-            if str(cur.get("id")) == pin_id and (
-                cur.get("images") or cur.get("videos") or cur.get("story_pin_data")
-            ):
-                found.append(cur)
-            stack.extend(cur.values())
-        elif isinstance(cur, list):
-            stack.extend(cur)
-    return found
-
-
-def _og(soup: BeautifulSoup, prop: str) -> str | None:
-    tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
-    return tag.get("content") if tag else None
-
-
-def _area(entry: dict) -> int:
-    return (entry.get("width") or 0) * (entry.get("height") or 0)
-
-
-def _image_candidates(pin: dict) -> list[str]:
-    images = pin.get("images") or {}
-    if not isinstance(images, dict):
-        return []
-    urls: list[str] = []
-    orig = images.get("orig")
-    if isinstance(orig, dict) and orig.get("url"):
-        urls.append(orig["url"])
-    others = sorted(
-        (v for k, v in images.items() if k != "orig" and isinstance(v, dict) and v.get("url")),
-        key=_area,
-        reverse=True,
-    )
-    urls.extend(v["url"] for v in others)
-    return urls
-
-
-def _walk_video_lists(node):
-    """Yield every {"video_list": {...}} payload nested inside node."""
-    stack = [node]
-    while stack:
-        cur = stack.pop()
-        if isinstance(cur, dict):
-            video_list = cur.get("video_list")
-            if isinstance(video_list, dict):
-                yield video_list
-            stack.extend(cur.values())
-        elif isinstance(cur, list):
-            stack.extend(cur)
-
-
-def _video_sources(pin: dict) -> tuple[list[str], list[str]]:
-    """Return (mp4_urls, m3u8_urls) for a pin, best quality first."""
-    mp4s: list[dict] = []
-    streams: list[dict] = []
-    # "videos" is a normal video pin; "story_pin_data" holds Idea/Story pin videos.
-    for source in (pin.get("videos"), pin.get("story_pin_data")):
-        if not source:
-            continue
-        for video_list in _walk_video_lists(source):
-            for entry in video_list.values():
-                if not isinstance(entry, dict):
-                    continue
-                url = entry.get("url")
-                if not isinstance(url, str) or not url.startswith("http"):
-                    continue
-                path = url.lower().split("?")[0]
-                if path.endswith(".mp4"):
-                    mp4s.append(entry)
-                elif path.endswith(".m3u8"):
-                    streams.append(entry)
-    mp4s.sort(key=_area, reverse=True)
-    streams.sort(key=_area, reverse=True)
-    return [e["url"] for e in mp4s], [e["url"] for e in streams]
-
-
-def _mp4_from_hls(url: str) -> str | None:
-    """
-    Pinterest often lists only the .m3u8 stream, but the matching plain .mp4
-    lives at the same path under /720p/. Worth a try before slower fallbacks.
-    """
-    guess = re.sub(r"\.m3u8(?:\?.*)?$", ".mp4", url.replace("/hls/", "/720p/"))
-    return guess if guess != url and guess.endswith(".mp4") else None
-
-
-
-def _html_media_urls(html: str) -> tuple[list[str], list[str]]:
-    """Find Pinterest CDN video URLs even when Pinterest's JSON is not exposed."""
-    mp4s: list[str] = []
-    streams: list[str] = []
-    # Pinterest commonly serves video from v1.pinimg.com or i.pinimg.com.
-    pattern = re.compile(
-        r'https?://[^"\'<>\s]+?\.(?:mp4|m3u8)(?:\?[^"\'<>\s]*)?',
-        re.I,
-    )
-    for raw in pattern.findall(html):
-        url = raw.replace("\\/", "/").replace("\\u0026", "&")
-        if not CDN_HOST.match(_host(url)):
-            continue
-        path = urlparse(url).path.lower()
-        if path.endswith(".mp4"):
-            mp4s.append(url)
-        elif path.endswith(".m3u8"):
-            streams.append(url)
-    return _dedupe(mp4s), _dedupe(streams)
-
-def _dedupe(items) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in items:
-        if item and item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
-
-
-def fetch_pin_api(pin_id: str) -> dict | None:
-    """
-    Ask Pinterest's own JSON endpoint about this pin. It reliably includes the
-    video list even when the HTML page doesn't. Returns None on any failure.
-    """
-    options = {"options": {"id": pin_id, "field_set_key": "detailed", "noCache": True}, "context": {}}
-    headers = {
-        **HEADERS,
-        "Accept": "application/json, text/javascript, */*, q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-        "X-Pinterest-AppState": "active",
-        "Referer": f"https://www.pinterest.com/pin/{pin_id}/",
-    }
-    try:
-        resp = requests.get(
-            "https://www.pinterest.com/resource/PinResource/get/",
-            params={"source_url": f"/pin/{pin_id}/", "data": json.dumps(options)},
-            headers=headers,
-            timeout=20,
-        )
-        if not resp.ok:
-            log.info("pin %s: API returned HTTP %s", pin_id, resp.status_code)
-            return None
-        data = resp.json()["resource_response"]["data"]
-    except Exception:  # noqa: BLE001 - this lookup is a bonus; it must never break the page parse
-        log.info("pin %s: API lookup failed", pin_id)
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _collect_media(pins: list[dict]):
-    """Gather image / mp4 / hls candidates from every dict describing the pin."""
-    images: list[str] = []
-    mp4s: list[str] = []
-    streams: list[str] = []
-    thumb = None
-    for pin in pins:
-        images.extend(_image_candidates(pin))
-        m, h = _video_sources(pin)
-        mp4s.extend(m)
-        streams.extend(h)
-        sizes = pin.get("images") if isinstance(pin.get("images"), dict) else {}
-        for key in ("736x", "474x"):
-            if not thumb and isinstance(sizes.get(key), dict) and sizes[key].get("url"):
-                thumb = sizes[key]["url"]
-    # Real originals first, then the largest remaining sizes.
-    images = sorted(_dedupe(images), key=lambda u: 0 if "/originals/" in u else 1)
-    return images, _dedupe(mp4s), _dedupe(streams), thumb
-
-
-_cache: dict[str, tuple[float, PinInfo]] = {}
-_cache_lock = threading.Lock()
-
-
-def get_pin_info(raw_url: str) -> PinInfo:
-    """Look up a pin and work out where its original media lives."""
-    url, pin_id = resolve_pin_url(raw_url)
-
-    with _cache_lock:
-        hit = _cache.get(pin_id)
-        if hit and time.time() - hit[0] < CACHE_TTL_SECONDS:
-            return hit[1]
-
-    html = fetch_html(url)
-    soup = BeautifulSoup(html, "html.parser")
-
-    pins: list[dict] = []
-    for blob in _json_blobs(soup):
-        pins.extend(find_pin_objects(blob, pin_id))
-
-    og_image = _og(soup, "og:image")
-    og_video = _og(soup, "og:video") or _og(soup, "og:video:url")
-
-    images, mp4s, streams, thumb = _collect_media(pins)
-
-    # Pinterest sometimes renders media into JavaScript without putting it in
-    # application/json script tags. Scan the raw HTML as a second extraction
-    # path so video pins are not incorrectly treated as photos.
-
-    # Pinterest often renders media into JavaScript instead of JSON script tags,
-    # so scan the raw HTML too. Without this, video pins get treated as photos.
-    html_mp4s, html_streams = _html_media_urls(html)
-    mp4s = _dedupe(mp4s + html_mp4s)
-    streams = _dedupe(streams + html_streams)
-
-    if og_video:
-        path = og_video.lower().split("?")[0]
-        if path.endswith(".mp4"):
-            mp4s = _dedupe(mp4s + [og_video])
-        elif path.endswith(".m3u8"):
-            streams = _dedupe(streams + [og_video])
-
-    html_saw_video = bool(mp4s or streams or og_video)
-    used_api = False
-    if not html_saw_video:
-        # The page didn't reveal a video. Double-check with Pinterest's JSON
-        # endpoint so video pins aren't mistaken for photos.
-        api_pin = fetch_pin_api(pin_id)
-        if api_pin:
-            used_api = True
-            api_images, api_mp4s, api_streams, api_thumb = _collect_media([api_pin])
-            images = _dedupe(images + api_images)
-            mp4s = _dedupe(mp4s + api_mp4s)
-            streams = _dedupe(streams + api_streams)
-            thumb = thumb or api_thumb
-
-    is_video = bool(mp4s or streams or og_video)
-
-    if og_image:
-        for candidate in (upscale_image_url(og_image), og_image):
-            if candidate not in images:
-                images.append(candidate)
-
-    # Plain .mp4 twins of the HLS streams (no ffmpeg needed) go after the real ones.
-    video_urls = _dedupe(mp4s + [g for g in map(_mp4_from_hls, streams) if g])
-
-    # Animated GIF pins: Pinterest also stores an mp4 copy, but people want the real .gif.
-    gif_urls = [u for u in images if urlparse(u).path.lower().endswith(".gif")]
-    if gif_urls:
-        is_video = False
-        images = gif_urls
-
-    log.info(
-        "pin %s: page_pins=%d api=%s og_video=%s mp4=%d hls=%d images=%d -> %s",
-        pin_id, len(pins), used_api, bool(og_video), len(mp4s), len(streams),
-        len(images), "VIDEO" if is_video else "photo",
-    )
-
-    if not is_video and not images:
-        raise PinError(
-            "Couldn't find an image or video on this pin. It may be private, "
-            "or Pinterest may have changed its page layout.",
-            422,
-        )
-
-    thumb = thumb or og_image or (images[0] if images else None)
-    title = (
-        _og(soup, "og:title")
-        or next((p.get("grid_title") or p.get("title") for p in pins if p.get("grid_title") or p.get("title")), None)
-        or f"Pin {pin_id}"
-    ).strip()
-
-    if is_video:
-        ext = ".mp4"
-    else:
-        ext = os.path.splitext(urlparse(images[0]).path)[1] or ".jpg"
-
-    info = PinInfo(
-        pin_id=pin_id,
-        url=url,
-        kind="video" if is_video else ("gif" if gif_urls else "image"),
-        title=title[:200],
-        thumbnail=thumb,
-        filename=f"{pin_id}{ext}",
-        image_urls=images,
-        video_urls=video_urls,
-        hls_urls=streams,
-    )
-    with _cache_lock:
-        if len(_cache) > 500:
-            _cache.clear()
-        _cache[pin_id] = (time.time(), info)
-    return info
-
-
-# --------------------------------------------------------------------------
-# Downloading
-# --------------------------------------------------------------------------
-
-_CONTENT_TYPE_EXT = {
-    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
-    "image/webp": ".webp", "video/mp4": ".mp4",
-}
-
-
-def _download_direct(url: str, out_dir: str, base: str) -> str:
-    """Stream a file from Pinterest's CDN into out_dir. Raises requests errors."""
-    if not CDN_HOST.match(_host(url)):
-        raise PinError("Unexpected media host.", 502)
-    with requests.get(url, headers=HEADERS, stream=True, timeout=30) as resp:
-        resp.raise_for_status()
-        ext = os.path.splitext(urlparse(url).path)[1]
-        if not ext:
-            ctype = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
-            ext = _CONTENT_TYPE_EXT.get(ctype, ".jpg")
-        dest = os.path.join(out_dir, f"{base}{ext}")
-        with open(dest + ".part", "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1 << 16):
-                if chunk:
-                    f.write(chunk)
-    os.replace(dest + ".part", dest)
-    return dest
-
-
-def _ffmpeg_path() -> str | None:
-    """System ffmpeg if present, else the binary bundled by imageio-ffmpeg."""
+def _ffmpeg() -> str | None:
     found = shutil.which("ffmpeg")
     if found:
         return found
@@ -500,69 +127,285 @@ def _ffmpeg_path() -> str | None:
         return None
 
 
-def _download_with_ytdlp(pin_url: str, out_dir: str, base: str) -> str:
+def _friendly(exc: Exception) -> IGError:
+    low = re.sub(r"\x1b\[[0-9;]*m", "", str(exc)).lower()
+    if "login" in low or "log in" in low or "rate-limit" in low or "rate limit" in low or "401" in low or "403" in low:
+        return IGError(LOGIN_MSG, 429)
+    if "private" in low:
+        return IGError("This account or post is private.", 403)
+    if "not found" in low or "404" in low or "unavailable" in low or "removed" in low:
+        return IGError("This post isn't available. It may have been deleted.", 404)
+    return IGError("Couldn't read this Instagram link.", 502)
+
+
+def _meta(soup, name):
+    tag = soup.find("meta", attrs={"property": name}) or soup.find("meta", attrs={"name": name})
+    return (tag.get("content") or "").strip() if tag else ""
+
+
+def _get_text(url: str, ua: str, timeout: int = 12) -> str:
     try:
-        import yt_dlp
-    except ImportError:
-        raise PinError("Video fallback needs yt-dlp. Run: pip install yt-dlp", 500)
-
-    ffmpeg = _ffmpeg_path()
-    has_ffmpeg = bool(ffmpeg)
-    options = {
-        "outtmpl": os.path.join(out_dir, f"{base}.%(ext)s"),
-        # Prefer a complete MP4 when available. If Pinterest exposes separate
-        # video/audio streams, yt-dlp will merge them when ffmpeg is installed.
-        "format": "bestvideo+bestaudio/best" if has_ffmpeg else "best[ext=mp4]/best",
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "retries": 3,
-        "fragment_retries": 3,
-        "http_headers": HEADERS,
-    }
-    if ffmpeg:
-        options["ffmpeg_location"] = ffmpeg
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.download([pin_url])
-    except yt_dlp.utils.DownloadError as exc:
-        message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc)).replace("ERROR: ", "")
-        raise PinError(f"Couldn't download the video: {message}", 502)
-
-    files = [
-        f for f in glob.glob(os.path.join(out_dir, f"{base}.*"))
-        if not f.endswith((".part", ".ytdl"))
-    ]
-    if not files:
-        raise PinError("The video download finished but produced no file.", 502)
-    return files[0]
+        r = _session().get(url, headers={"User-Agent": ua}, timeout=timeout)
+    except requests.RequestException as exc:
+        raise IGError("Couldn't reach Instagram. Please try again.", 502) from exc
+    if r.status_code == 404:
+        raise IGError("This post or profile wasn't found.", 404)
+    return r.text
 
 
-def download_media(info: PinInfo, out_dir: str) -> str:
-    """Download the pin's media into out_dir and return the file path."""
-    base = info.pin_id
+def _fetch_html(url: str) -> BeautifulSoup:
+    return BeautifulSoup(_get_text(url, BOT_UA), "html.parser")
 
-    if info.kind == "video":
-        # 1) Direct .mp4 files: fast and need no ffmpeg.
-        for video_url in info.video_urls:
-            try:
-                return _download_direct(video_url, out_dir, base)
-            except (requests.RequestException, PinError):
-                log.info("pin %s: direct video failed: %s", info.pin_id, video_url)
-        # 2) yt-dlp on the pin page, then on the raw stream. Never hand back the
-        #    poster photo in place of a video.
-        first_error: PinError | None = None
-        for target in [info.url, *info.hls_urls]:
-            try:
-                return _download_with_ytdlp(target, out_dir, base)
-            except PinError as exc:
-                first_error = first_error or exc
-        raise first_error or PinError("Couldn't download the video.", 502)
 
-    for image_url in info.image_urls:
+def _unescape(v: str) -> str:
+    for _ in range(3):
+        v = v.replace("\\\\", "\\")
+    return v.replace("\\u0026", "&").replace("\\/", "/").replace("&amp;", "&")
+
+
+def _grab(html: str, key: str) -> str:
+    m = re.search(r'"?' + key + r'\\*"\s*:\s*\\*"([^"]+?)\\*"', html)
+    return _unescape(m.group(1)) if m else ""
+
+
+def _find_nodes(obj):
+    if isinstance(obj, dict):
+        side = obj.get("edge_sidecar_to_children")
+        if isinstance(side, dict):
+            for e in side.get("edges", []):
+                n = e.get("node") if isinstance(e, dict) else None
+                if isinstance(n, dict) and (n.get("video_url") or n.get("display_url")):
+                    yield n
+            return
+        if obj.get("video_url") or obj.get("display_url"):
+            yield obj
+            return
+        for v in obj.values():
+            yield from _find_nodes(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _find_nodes(v)
+
+
+def _nodes_from_html(html: str) -> list[dict]:
+    blobs = []
+    m = re.search(r'"contextJSON"\s*:\s*"((?:[^"\\]|\\.)*)"', html)
+    if m:
         try:
-            return _download_direct(image_url, out_dir, base)
-        except (requests.RequestException, PinError):
-            continue  # e.g. /originals/ missing -> fall back to the next size
-    raise PinError("Pinterest wouldn't serve the image file. Try again in a moment.", 502)
+            blobs.append(json.loads(json.loads('"' + m.group(1) + '"')))
+        except ValueError:
+            pass
+    for m in re.finditer(r"__additionalDataLoaded\(\s*'[^']*'\s*,\s*(\{.*?\})\s*\)\s*;", html, re.S):
+        try:
+            blobs.append(json.loads(m.group(1)))
+        except ValueError:
+            pass
+    for blob in blobs:
+        nodes = list(_find_nodes(blob))[:10]
+        if nodes:
+            return nodes
+    video, image = _grab(html, "video_url"), _grab(html, "display_url")
+    return [{"video_url": video, "display_url": image}] if (video or image) else []
+
+
+def _classify(entry: dict):
+    url = entry.get("url") or ""
+    ext = (entry.get("ext") or "").lower()
+    formats = entry.get("formats") or []
+    has_video = any(f.get("vcodec") not in (None, "none") for f in formats)
+    if ext in IMG_EXT or (not has_video and re.search(r"\.(?:jpe?g|png|webp)(?:\?|$)", url, re.I)):
+        src = url or (formats[-1].get("url") if formats else None) or entry.get("thumbnail")
+        return "image", src
+    return "video", None
+
+
+def _ytdlp_media(kind: str, code: str) -> list[Media]:
+    url = f"https://www.instagram.com/{kind}/{code}/"
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 10, "retries": 0,
+            "extractor_retries": 0}
+    if COOKIES:
+        opts["cookiefile"] = COOKIES
+    if PROXY:
+        opts["proxy"] = PROXY
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as exc:
+        raise _friendly(exc) from exc
+    entries = [e for e in (data.get("entries") or [data]) if e]
+    out = []
+    for i, e in enumerate(entries):
+        k, src = _classify(e)
+        many = len(entries) > 1
+        suffix = f"_{i + 1}" if many else ""
+        if k == "image":
+            out.append(Media("image", e.get("thumbnail") or src, f"{code}{suffix}.jpg", src, "Photo", "ytdlp", i))
+        else:
+            out.append(Media("video", e.get("thumbnail"), f"{code}{suffix}.mp4", None,
+                             "Reel" if kind == "reel" else "Video", "ytdlp", i))
+    return out
+
+
+def _og_media(kind: str, code: str) -> list[Media]:
+    soup = _fetch_html(f"https://www.instagram.com/{kind}/{code}/")
+    video = _meta(soup, "og:video:secure_url") or _meta(soup, "og:video")
+    image = _meta(soup, "og:image")
+    if video:
+        return [Media("video", image or None, f"{code}.mp4", video, "Reel" if kind == "reel" else "Video", "og")]
+    if image:
+        return [Media("image", image, f"{code}.jpg", image, "Photo", "og")]
+    raise IGError(LOGIN_MSG, 429)
+
+
+def _embed_media(kind: str, code: str) -> list[Media]:
+    """No-login method: the public embed page of a post lists its media."""
+    html = _get_text(f"https://www.instagram.com/{'reel' if kind == 'reel' else 'p'}/{code}/embed/captioned/", DESKTOP_UA)
+    nodes = _nodes_from_html(html)
+    out = []
+    for i, n in enumerate(nodes):
+        suffix = f"_{i + 1}" if len(nodes) > 1 else ""
+        video, image = n.get("video_url"), n.get("display_url")
+        if video:
+            out.append(Media("video", image or None, f"{code}{suffix}.mp4", video,
+                             "Reel" if kind == "reel" else "Video", "og", i))
+        elif image:
+            out.append(Media("image", image, f"{code}{suffix}.jpg", image, "Photo", "og", i))
+    return out
+
+
+def _resolve_post(kind: str, code: str) -> IGInfo:
+    # With a logged-in cookie or proxy, yt-dlp is the most reliable; otherwise try the no-login methods first.
+    steps = [_ytdlp_media, _embed_media, _og_media] if (COOKIES or PROXY) else [_embed_media, _og_media, _ytdlp_media]
+    media: list[Media] = []
+    errors: list[IGError] = []
+    deadline = time.time() + LOOKUP_BUDGET
+    for step in steps:
+        if time.time() > deadline - 5:
+            log.warning("IG %s: time budget used up, skipping %s", code, step.__name__)
+            continue
+        t0 = time.time()
+        try:
+            media = step(kind, code)
+            log.warning("IG %s: %s -> %d item(s) in %.1fs", code, step.__name__, len(media), time.time() - t0)
+        except IGError as exc:
+            errors.append(exc)
+            log.warning("IG %s: %s failed in %.1fs: %s", code, step.__name__, time.time() - t0, exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("IG %s: %s crashed in %.1fs: %r", code, step.__name__, time.time() - t0, exc)
+        if media:
+            break
+    if not media:
+        hard = [e for e in errors if e.status in (403, 404)]
+        raise (hard[0] if hard else IGError(LOGIN_MSG, 429))
+    for i, m in enumerate(media):
+        m.index = i
+    canonical = f"https://www.instagram.com/{kind}/{code}/"
+    return IGInfo(key=f"post:{code}", kind="post", title=f"Instagram {media[0].label.lower()} {code}",
+                  canonical=canonical, media=media, post_url=canonical)
+
+
+def _resolve_profile(username: str) -> IGInfo:
+    pic, name = None, ""
+    try:
+        sess = _session()
+        headers = {"User-Agent": WEB_UA, "x-ig-app-id": "936619743392459"}
+        token = sess.cookies.get("csrftoken")
+        if token:
+            headers["x-csrftoken"] = token
+        r = sess.get("https://i.instagram.com/api/v1/users/web_profile_info/", params={"username": username},
+                     headers=headers, timeout=12)
+        if r.status_code == 404:
+            raise IGError("No Instagram account with that username.", 404)
+        if r.status_code == 200:
+            user = (r.json().get("data") or {}).get("user") or {}
+            pic = user.get("profile_pic_url_hd") or user.get("profile_pic_url")
+            name = user.get("full_name") or ""
+    except IGError:
+        raise
+    except (requests.RequestException, ValueError):
+        pass
+    if not pic:  # public embed page of the profile
+        try:
+            html = _get_text(f"https://www.instagram.com/{username}/embed/", DESKTOP_UA)
+            pic = _grab(html, "profile_pic_url_hd") or _grab(html, "profile_pic_url")
+        except IGError as exc:
+            if exc.status == 404:
+                raise
+    if not pic:  # social-preview tags (works for private accounts too, usually smaller)
+        try:
+            pic = _meta(_fetch_html(f"https://www.instagram.com/{username}/"), "og:image")
+        except IGError as exc:
+            if exc.status == 404:
+                raise
+    if not pic:
+        raise IGError(LOGIN_MSG, 429)
+    title = f"{name} (@{username})" if name else f"@{username}"
+    media = [Media("dp", pic, f"{username}_profile.jpg", pic, "Profile photo", "api", 0)]
+    return IGInfo(key=f"profile:{username}", kind="profile", title=title,
+                  canonical=f"https://www.instagram.com/{username}/", media=media)
+
+
+_cache: dict[str, tuple[float, IGInfo]] = {}
+_lock = threading.Lock()
+
+
+def resolve(raw: str) -> IGInfo:
+    kind, ident = parse_input(raw)
+    key = f"post:{ident[1]}" if kind == "post" else f"profile:{ident}"
+    with _lock:
+        hit = _cache.get(key)
+        if hit and time.time() - hit[0] < 600:
+            return hit[1]
+    info = _resolve_post(*ident) if kind == "post" else _resolve_profile(ident)
+    with _lock:
+        if len(_cache) > 300:
+            _cache.clear()
+        _cache[key] = (time.time(), info)
+    return info
+
+
+def _direct(url: str, out_dir: str, filename: str) -> str:
+    if not CDN_HOST.search(urlparse(url).hostname or ""):
+        raise IGError("Blocked an unexpected download address.", 400)
+    path = os.path.join(out_dir, filename)
+    try:
+        with requests.get(url, headers={"User-Agent": WEB_UA}, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            size = 0
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(1 << 16):
+                    size += len(chunk)
+                    if size > MAX_BYTES:
+                        raise IGError("File is too large.", 413)
+                    f.write(chunk)
+    except requests.RequestException as exc:
+        raise IGError("Instagram wouldn't serve the file. Try again in a moment.", 502) from exc
+    return path
+
+
+def download_item(info: IGInfo, index: int, out_dir: str) -> str:
+    if not 0 <= index < len(info.media):
+        raise IGError("That item doesn't exist.", 404)
+    m = info.media[index]
+    if m.url and m.via in ("og", "api") or (m.kind == "image" and m.url):
+        return _direct(m.url, out_dir, m.filename)
+    opts = {"quiet": True, "no_warnings": True, "socket_timeout": 20, "retries": 2,
+            "outtmpl": os.path.join(out_dir, os.path.splitext(m.filename)[0] + ".%(ext)s"),
+            "playlist_items": str(index + 1), "merge_output_format": "mp4"}
+    ff = _ffmpeg()
+    opts["format"] = "bv*+ba/b" if ff else "best[ext=mp4]/best"
+    if ff:
+        opts["ffmpeg_location"] = ff
+    if COOKIES:
+        opts["cookiefile"] = COOKIES
+    if PROXY:
+        opts["proxy"] = PROXY
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(info.post_url, download=True)
+    except yt_dlp.utils.DownloadError as exc:
+        raise _friendly(exc) from exc
+    files = [f for f in glob.glob(os.path.join(out_dir, "*")) if not f.endswith((".part", ".ytdl"))]
+    if not files:
+        raise IGError("Couldn't download this video.", 502)
+    return max(files, key=os.path.getsize)
