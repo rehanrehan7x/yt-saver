@@ -498,6 +498,17 @@ def ig_lookup():
         return jsonify(error="Something went wrong looking this up."), 500
 
 
+@app.get("/api/ig/debug")
+def ig_debug():
+    key = os.environ.get("IG_DEBUG_KEY")
+    if not key or request.args.get("key") != key:
+        return jsonify(error="Not found."), 404
+    try:
+        return jsonify(ig.debug_report(request.args.get("u", "")))
+    except ig.IGError as exc:
+        return jsonify(error=str(exc)), 400
+
+
 @app.get("/ig/download")
 def ig_download():
     raw = request.args.get("u", "")
