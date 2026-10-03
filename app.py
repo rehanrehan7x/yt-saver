@@ -145,31 +145,31 @@ for _pg in PAGES:
 
 IG_PAGES = [
     dict(path="/instagram-downloader", nav="Instagram Downloader", ph="Paste Instagram link or @username here",
-         title="Instagram Downloader: Reels, Photos & Profile Pictures | MaxDownloader",
+         title="Instagram Downloader: Reels, Photos, DP | MaxDownloader",
          h1="Instagram Downloader",
          desc="Download Instagram reels, videos, photos and profile pictures (DP) for free. Paste a public link or username. No sign-up, no app.",
          lede="Paste a public reel, photo or story link, or just a username to get the profile picture.",
          intro="Works with public posts, stories and profiles. Paste a post or reel link to download the video or photos, paste a story link to save that account's active stories, or type a username to get the profile picture in the largest size Instagram offers."),
     dict(path="/instagram-reels-downloader", nav=None, ph="Paste Instagram reel link here",
-         title="Instagram Reels Downloader: Save Reels as MP4 | MaxDownloader",
+         title="Instagram Reels Downloader: Save as MP4 | MaxDownloader",
          h1="Instagram Reels Downloader",
          desc="Download Instagram reels as MP4 video for free. Paste the reel link and save it. No watermark overlay, no sign-up.",
          lede="Copy a reel's link, paste it here and save the video as an MP4 file.",
          intro="Open the reel in Instagram, tap Share, then Copy link. Paste it above and we fetch the video file for you. Only public reels work."),
     dict(path="/instagram-photo-downloader", nav=None, ph="Paste Instagram photo link here",
-         title="Instagram Photo Downloader: Save Pictures in Full Size | MaxDownloader",
+         title="Instagram Photo Downloader: Full Size | MaxDownloader",
          h1="Instagram Photo Downloader",
          desc="Download Instagram photos and carousel images in full size for free. Paste a public post link and save each picture.",
          lede="Paste a public photo post and save the picture in full size.",
          intro="For posts with several photos, each picture appears as its own card with a Download button. Only public posts work."),
     dict(path="/instagram-story-downloader", nav=None, ph="Paste story link or @username here", mode="story",
-         title="Instagram Story Downloader: Save Stories as Photo or Video | MaxDownloader",
+         title="Instagram Story Downloader: Photo & Video | MaxDownloader",
          h1="Instagram Story Downloader",
          desc="Download Instagram stories (photos and videos) from public accounts for free. Type a username or paste a story link.",
          lede="Type a username or paste a story link to save the account's active stories.",
          intro="Stories disappear after 24 hours, so save them while they're live. Every active story from a public account shows up as its own card: photos as JPG and videos as MP4. Stories from private accounts can't be downloaded."),
     dict(path="/instagram-dp-downloader", nav=None, ph="Paste @username or profile link here",
-         title="Instagram DP Downloader: View & Save Profile Picture | MaxDownloader",
+         title="Instagram DP Downloader: Save Profile Pic | MaxDownloader",
          h1="Instagram DP Downloader",
          desc="Download an Instagram profile picture (DP) in full size for free. Type a username or paste a profile link.",
          lede="Type a username or paste a profile link to save the profile picture in the biggest size available.",
@@ -312,7 +312,13 @@ def tool_groups():
 
 @app.context_processor
 def inject_site():
-    return {"site_name": SITE_NAME, "tool_groups": tool_groups()}
+    return {"site_name": SITE_NAME, "tool_groups": tool_groups(), "site_base": site_url()}
+
+
+@app.get("/google6f0c92908fcd9963.html")
+def google_site_verification():
+    """Google Search Console ownership file. Keep this route; removing it un-verifies the site."""
+    return Response("google-site-verification: google6f0c92908fcd9963.html", mimetype="text/html")
 
 
 @app.get("/healthz")
