@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block head_extra %}<script type="application/ld+json">{{ jsonld|safe }}</script>{% endblock %}
+{% block content %}
+<main class="guide">
+  <p class="crumbs"><a href="/">Home</a> &rsaquo; <a href="/guides">Guides</a></p>
+  <h1>{{ g.h1 }}</h1>
+  <p class="updated">Updated: {{ updated }}</p>
+  <p class="lede">{{ g.lede }}</p>
+  <p><a class="btn" href="{{ g.tool }}">{{ g.cta }}</a></p>
+  {% for p in g.intro %}<p>{{ p }}</p>{% endfor %}
+
+  <section class="band">
+    <h2>{{ g.steps_title }}</h2>
+    <ol class="steps">{% for st, sd in g.steps %}<li><span><strong>{{ st }}</strong>{{ sd }}</span></li>{% endfor %}</ol>
+    <p><a class="btn" href="{{ g.tool }}">{{ g.cta }}</a></p>
+  </section>
+
+  <section class="band">
+    <h2>Kaam ki tips</h2>
+    <ul class="plain">{% for tip in g.tips %}<li>{{ tip }}</li>{% endfor %}</ul>
+  </section>
+
+  {% if g.problems %}<section class="band">
+    <h2>Common problems aur unka hal</h2>
+    {% for pr, fx in g.problems %}<details><summary>{{ pr }}</summary><p>{{ fx }}</p></details>{% endfor %}
+  </section>{% endif %}
+
+  <section class="band">
+    <h2>Aksar pooche jaane wale sawal</h2>
+    {% for q, a in g.faq %}<details><summary>{{ q }}</summary><p>{{ a }}</p></details>{% endfor %}
+  </section>
+
+  <section class="band">
+    <h2>Ye bhi padhein</h2>
+    <ul class="plain">{% for r in related %}<li><a href="/guides/{{ r.slug }}">{{ r.h1 }}</a></li>{% endfor %}</ul>
+  </section>
+</main>
+{% endblock %}
