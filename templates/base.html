@@ -27,7 +27,8 @@
   <meta name="application-name" content="{{ site_name }}">
   <meta name="format-detection" content="telephone=no">
   <meta name="theme-color" content="#D4202A">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Ccircle cx=%2716%27 cy=%2716%27 r=%2714%27 fill=%27%23D4202A%27/%3E%3Cpath d=%27M16 8v11m0 0l-4-4m4 4l4-4M9 23h14%27 stroke=%27white%27 stroke-width=%272.5%27 fill=%27none%27 stroke-linecap=%27round%27/%3E%3C/svg%3E">
+  <link rel="icon" type="image/png" sizes="48x48" href="/static/favicon-48.png">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;800&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -153,7 +154,7 @@
 </head>
 <body{% block body_attrs %}{% endblock %}>
 <header class="site"><div class="in">
-  <a class="brand" href="/" aria-label="{{ site_name }} home"><svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="6" fill="#D4202A"/><path d="M16 7v13m0 0l-5-5m5 5l5-5M8 25h16" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>{{ site_name }}</a>
+  <a class="brand" href="/" aria-label="{{ site_name }} home"><img src="/static/logo.png" alt="" width="30" height="30">{{ site_name }}</a>
   <nav aria-label="Main">
     {% for g in tool_groups %}{% if g.top %}<a class="top" href="{{ g.home }}">{{ g.name }}</a>{% endif %}{% endfor %}
     <button type="button" class="menu-btn" id="menu-btn" aria-expanded="false" aria-controls="mega">All tools <span aria-hidden="true">&#9662;</span></button>
