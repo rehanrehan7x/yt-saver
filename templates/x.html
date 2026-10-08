@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block head_extra %}<meta name="referrer" content="no-referrer"><script type="application/ld+json">{{ jsonld|safe }}</script>{% endblock %}
+{% block body_attrs %} class="pin ig"{% endblock %}
+{% block content %}
+<main>
+  <h1>{{ page.h1 }}</h1>
+  <p class="lede">{{ page.lede }}</p>
+
+  <form id="form" novalidate>
+    <label for="url" class="sr-only">Tweet link</label>
+    <div class="row">
+      <input type="text" id="url" inputmode="url" placeholder="{{ page.ph }}" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button type="submit" id="go" class="primary">Get media</button>
+      <button type="button" id="paste" class="secondary">Paste</button>
+    </div>
+  </form>
+  <p id="status" role="status" aria-live="polite"></p>
+  <section id="results" class="board" aria-label="Results"></section>
+
+  <section class="band">
+    <h2>{{ page.h2_how or "How it works" }}</h2>
+    {% if page.steps %}<ol class="steps">{% for st, sd in page.steps %}<li><span><strong>{{ st }}</strong>{{ sd }}</span></li>{% endfor %}</ol>
+    {% else %}<ol class="steps">
+      <li><span><strong>Copy the tweet link</strong>On X, press Share on the tweet and choose Copy link. In a browser, copy the address from the address bar.</span></li>
+      <li><span><strong>Paste it above</strong>Press Get media. Each video, photo or GIF in the tweet shows up as its own card.</span></li>
+      <li><span><strong>Press Download</strong>Videos and GIFs save as MP4, photos save in their original size.</span></li>
+    </ol>{% endif %}
+    <p>{{ page.intro }}</p>
+  </section>
+
+  {% if related_guides %}<section class="band">
+    <h2>{{ "Ye guides bhi padhein" if page.lang else "Helpful guides (Hinglish)" }}</h2>
+    <ul class="plain">{% for g in related_guides %}<li><a href="/guides/{{ g.slug }}">{{ g.h1 }}</a></li>{% endfor %}</ul>
+  </section>{% endif %}
+
+  <section class="band">
+    <h2>{{ page.h2_faq or "Questions people ask" }}</h2>
+    {% for q, a in faq %}<details><summary>{{ q }}</summary><p>{{ a }}</p></details>{% endfor %}
+  </section>
+</main>
+<script>
+(() => {
+  const form = document.getElementById('form'), field = document.getElementById('url'), goBtn = document.getElementById('go');
+  const statusEl = document.getElementById('status'), board = document.getElementById('results');
+  function setStatus(t, err = false) { statusEl.textContent = t; statusEl.classList.toggle('is-error', err); }
+  function el(tag, props = {}, ...kids) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(props)) { if (k === 'class') n.className = v; else if (k in n) n[k] = v; else n.setAttribute(k, v); }
+    n.append(...kids); return n;
+  }
+  function parseInput(text) {
+    const m = text.match(/(?:https?:\/\/)?(?:[\w-]+\.)*(?:twitter\.com|x\.com|fxtwitter\.com|vxtwitter\.com|fixupx\.com|t\.co)\/[^\s"'<>]+/i);
+    return m ? m[0] : text.trim();
+  }
+  async function readError(res, fallback) { try { return (await res.json()).error || fallback; } catch (_) { return fallback; } }
+  function filenameFrom(res, fallback) {
+    const m = (res.headers.get('Content-Disposition') || '').match(/filename="?([^";]+)"?/i);
+    return m ? m[1] : fallback;
+  }
+  const previewUrl = (source, index) => `/x/preview?u=${encodeURIComponent(source)}&i=${index}`;
+
+  function itemCard(item, source, i) {
+    const print = el('div', { class: 'print' });
+    if (item.thumbnail) {
+      print.append(el('img', { src: previewUrl(source, item.index), alt: item.label, loading: 'lazy', referrerPolicy: 'no-referrer' }));
+    }
+    print.append(el('span', { class: 'kind' }, item.label));
+    let select = null;
+    if (item.qualities && item.qualities.length > 1) {
+      select = el('select', { 'aria-label': 'Video quality' }, ...item.qualities.map((q, k) => el('option', { value: String(k) }, k === 0 ? `${q} (best)` : q)));
+      select.style.marginBottom = '10px';
+    }
+    const btn = el('button', { type: 'button', class: 'primary' }, 'Download');
+    const note = el('p', { class: 'note', hidden: true });
+    btn.addEventListener('click', async () => {
+      btn.disabled = true; if (select) select.disabled = true; btn.textContent = 'Preparing…'; note.hidden = true; note.className = 'note';
+      try {
+        const v = select ? select.value : 0;
+        const res = await fetch(`/x/download?u=${encodeURIComponent(source)}&i=${item.index}&v=${v}`);
+        if (!res.ok) throw new Error(await readError(res, 'Download failed. Please try again.'));
+        const total = +res.headers.get('Content-Length') || 0, reader = res.body.getReader(), parts = []; let got = 0;
+        for (;;) {
+          const { done, value } = await reader.read(); if (done) break;
+          parts.push(value); got += value.length;
+          if (total) btn.textContent = `Downloading ${Math.round(got / total * 100)}%`;
+        }
+        const a = el('a', { href: URL.createObjectURL(new Blob(parts)), download: filenameFrom(res, item.filename) });
+        document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 15000);
+        btn.textContent = 'Saved. Download again';
+      } catch (e) {
+        btn.textContent = 'Download'; note.hidden = false; note.textContent = e.message || 'Download failed.'; note.classList.add('is-error');
+      } finally { btn.disabled = false; if (select) select.disabled = false; }
+    });
+    const caption = el('div', { class: 'caption' }, el('p', { class: 'file' }, item.size ? `${item.filename} \u00b7 ${item.size}` : item.filename));
+    if (select) caption.append(select);
+    caption.append(btn, note);
+    if (item.kind === 'photo') {
+      caption.append(el('a', { class: 'view', href: previewUrl(source, item.index), target: '_blank', rel: 'noopener' }, 'View preview'));
+    }
+    return el('article', { class: 'card', style: `--i:${i}` }, print, caption);
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const source = parseInput(field.value);
+    if (!source) { setStatus('Paste a tweet link first.', true); field.focus(); return; }
+    goBtn.disabled = true; goBtn.textContent = 'Looking up…'; board.replaceChildren();
+    board.append(el('article', { class: 'card' }, el('div', { class: 'print' }, el('div', { class: 'skeleton' }))));
+    setStatus('Looking it up. This can take up to a minute if the server was asleep.');
+    try {
+      const res = await fetch('/api/x/lookup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: source }) });
+      if (!res.ok) throw new Error(await readError(res, `The server is busy or waking up (code ${res.status}). Please try again in a minute.`));
+      const data = await res.json();
+      board.replaceChildren(...data.items.map((it, i) => itemCard(it, source, i)));
+      setStatus(data.items.length > 1 ? `${data.title}: ${data.items.length} items found.` : data.title);
+    } catch (err) {
+      board.replaceChildren(); setStatus(err.message || "Couldn't reach the server. Check your connection and try again.", true);
+    } finally { goBtn.disabled = false; goBtn.textContent = 'Get media'; }
+  });
+
+  document.getElementById('paste').addEventListener('click', async () => {
+    try { field.value = await navigator.clipboard.readText(); form.requestSubmit(); }
+    catch (_) { setStatus('Your browser blocked clipboard access. Paste with Ctrl+V (or long-press) instead.', true); field.focus(); }
+  });
+})();
+</script>
+{% endblock %}
