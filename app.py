@@ -18,7 +18,7 @@ log = logging.getLogger("ytsaver")
 
 YT_HOST = re.compile(r"^(?:[a-z0-9-]+\.)*(?:youtube\.com|youtu\.be)$", re.I)
 VIDEO_ID = re.compile(r"[\w-]{11}")
-MAX_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 3 * 3600))
+MAX_SECONDS = 0
 STANDARD_HEIGHTS = [2160, 1440, 1080, 720, 480, 360, 240, 144]
 
 # A lookup already did the slow part (talking to YouTube), so the download step reuses it for a few minutes.
