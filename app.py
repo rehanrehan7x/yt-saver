@@ -549,8 +549,8 @@ def api_info():
         return jsonify(error="That link doesn't point to a single video."), 400
     if data.get("is_live"):
         return jsonify(error="Live streams can't be downloaded."), 400
-    if (data.get("duration") or 0) > MAX_SECONDS:
-        return jsonify(error=f"Videos longer than {MAX_SECONDS // 3600} hours aren't supported."), 400
+    if MAX_SECONDS and (data.get("duration") or 0) > MAX_SECONDS:
+    return jsonify(error=f"Videos longer than {MAX_SECONDS // 3600} hours aren't supported."), 400
 
     _cache_info(data)
     top = max((f.get("height") or 0 for f in data.get("formats", [])
@@ -576,7 +576,7 @@ def download():
     ff = ffmpeg_path()
     opts = {**base_opts(), "outtmpl": os.path.join(tmp, "%(id)s.%(ext)s"),
             "concurrent_fragment_downloads": 4, "http_chunk_size": 10 * 1024 * 1024,
-            "match_filter": yt_dlp.utils.match_filter_func(f"duration <= {MAX_SECONDS} & !is_live")}
+            "match_filter": yt_dlp.utils.match_filter_func("!is_live")}
     if ff:
         opts["ffmpeg_location"] = ff
     if fmt == "mp3":
