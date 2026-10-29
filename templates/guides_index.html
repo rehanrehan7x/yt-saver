@@ -1,8 +1,0 @@
-{% extends "base.html" %}
-{% block content %}
-<main class="wrap narrow prose">
-  <h1>Guides: How to Download Videos and Photos</h1>
-  <p class="lede">Step-by-step guides for downloading Instagram Reels, stories and photos, YouTube videos, Pinterest pins and Twitter (X) videos.</p>
-  <ul class="guide-list">{% for g in guides %}<li><h2><a href="/guides/{{ g.slug }}">{{ g.h1 }}</a></h2><p>{{ g.desc }}</p></li>{% endfor %}</ul>
-</main>
-{% endblock %}
