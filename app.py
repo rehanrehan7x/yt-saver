@@ -1,0 +1,1194 @@
+"""Video Saver - download YouTube videos as MP4 or audio as MP3 (yt-dlp)."""
+from __future__ import annotations
+
+import copy, glob, json, logging, mimetypes, os, re, shutil, tempfile, threading, time, webbrowser
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote, urlparse
+
+import yt_dlp
+import instagram_core as ig
+import twitter_core as xc
+from guides import BY_SLUG, GUIDES, OLD_SLUGS, UPDATED as GUIDES_UPDATED
+from seo_content import PAGE_EXTRA, HOME_EXTRA, SITE_UPDATED, LEGAL_UPDATED
+import pinterest_core as core
+import requests
+from flask import Flask, Response, jsonify, render_template, request, redirect, send_from_directory
+
+app = Flask(__name__)
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 7 * 24 * 3600  # logo, icons and og-image can be cached for a week
+log = logging.getLogger("ytsaver")
+
+YT_HOST = re.compile(r"^(?:[a-z0-9-]+\.)*(?:youtube\.com|youtu\.be)$", re.I)
+VIDEO_ID = re.compile(r"[\w-]{11}")
+MAX_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 3 * 3600))
+STANDARD_HEIGHTS = [2160, 1440, 1080, 720, 480, 360, 240, 144]
+
+# A lookup already did the slow part (talking to YouTube), so the download step reuses it for a few minutes.
+INFO_TTL, INFO_MAX = 300, 12
+_info_cache: dict[str, tuple[float, dict]] = {}
+_info_lock = threading.Lock()
+# On a small server, many parallel downloads make every one of them slow, so we queue them.
+MAX_PARALLEL = max(1, int(os.environ.get("MAX_PARALLEL_DOWNLOADS", "2")))
+QUEUE_WAIT = int(os.environ.get("DOWNLOAD_QUEUE_WAIT", "75"))
+_dl_slots = threading.BoundedSemaphore(MAX_PARALLEL)
+
+
+def _cache_info(data: dict) -> None:
+    with _info_lock:
+        now = time.time()
+        for k in [k for k, (ts, _) in _info_cache.items() if now - ts > INFO_TTL]:
+            _info_cache.pop(k, None)
+        while len(_info_cache) >= INFO_MAX:
+            _info_cache.pop(min(_info_cache, key=lambda k: _info_cache[k][0]), None)
+        _info_cache[data["id"]] = (now, data)
+
+
+def _cached_info(vid: str):
+    with _info_lock:
+        hit = _info_cache.get(vid)
+        return hit[1] if hit and time.time() - hit[0] <= INFO_TTL else None
+
+
+def _video_id_from_url(url: str):
+    p = urlparse(url)
+    host = (p.hostname or "").lower()
+    if host.endswith("youtu.be"):
+        cand = p.path.strip("/").split("/")[0]
+    else:
+        q = dict(x.split("=", 1) for x in p.query.split("&") if "=" in x)
+        cand = q.get("v", "")
+        if not cand:
+            parts = [s for s in p.path.split("/") if s]
+            if len(parts) >= 2 and parts[0] in ("shorts", "embed", "live", "v"):
+                cand = parts[1]
+    return cand if VIDEO_ID.fullmatch(cand or "") else None
+
+# Secret files on hosts are often read-only; yt-dlp wants to write cookies back.
+COOKIES = None
+_src = os.environ.get("YT_COOKIES_FILE")
+if _src and os.path.isfile(_src):
+    COOKIES = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+    shutil.copyfile(_src, COOKIES)
+
+
+# YouTube is blocking this server's IP address, so the YouTube tools are switched off for now.
+# This also stops the server from sending YouTube requests, which lets a rate limit cool down.
+# To turn YouTube back on: set the environment variable YT_PAUSED=0 on Render (or on your own server) and redeploy.
+YT_PAUSED = os.environ.get("YT_PAUSED", "1") != "0"
+YT_PAUSED_MSG = ("YouTube downloads are temporarily unavailable. We are working on it. "
+                 "You can still use our Instagram, Pinterest and X (Twitter) tools.")
+
+
+class YTError(Exception):
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
+
+
+def ffmpeg_path() -> str | None:
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def base_opts() -> dict:
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
+            "socket_timeout": 20, "retries": 3}
+    runtimes = {n: {} for n in ("deno", "node", "bun") if shutil.which(n)}
+    if runtimes:
+        opts["js_runtimes"] = runtimes
+    if COOKIES:
+        opts["cookiefile"] = COOKIES
+    return opts
+
+
+class YtLog:
+    """Collects what yt-dlp says while it works. Its warnings usually explain WHY an extraction failed."""
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def debug(self, msg):
+        if not str(msg).startswith("[debug]"):
+            self.lines.append(str(msg))
+
+    def info(self, msg):
+        self.lines.append(str(msg))
+
+    def warning(self, msg):
+        self.lines.append("WARNING: " + str(msg))
+
+    def error(self, msg):
+        self.lines.append("ERROR: " + str(msg))
+
+    def text(self, limit: int = 900) -> str:
+        return re.sub(r"\x1b\[[0-9;]*m", "", " | ".join(self.lines))[-limit:]
+
+
+def friendly(exc: Exception) -> YTError:
+    raw = re.sub(r"\x1b\[[0-9;]*m", "", str(exc)).replace("ERROR: ", "")
+    low = raw.lower()
+    if any(k in low for k in ("not a bot", "sign in to confirm", "failed to extract any player response",
+                              "http error 429", "http error 403", "too many requests")):
+        return YTError(YT_PAUSED_MSG, 503)
+    if "private video" in low:
+        return YTError("This video is private.")
+    if "age" in low and "restrict" in low:
+        return YTError("This video is age-restricted. A cookies file from a logged-in browser is needed.")
+    if "unavailable" in low or "removed" in low or "not available" in low:
+        return YTError("This video isn't available (removed, private, or blocked in this country).", 404)
+    return YTError(f"Couldn't read this video: {raw[:160]}", 502)
+
+
+def clean_url(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        raise YTError("Paste a YouTube link.")
+    if not re.match(r"^https?://", raw, re.I):
+        raw = "https://" + raw
+    host = (urlparse(raw).hostname or "").lower()
+    if not YT_HOST.match(host):
+        raise YTError("That isn't a YouTube link.")
+    return raw
+
+
+SITE_NAME = os.environ.get("SITE_NAME", "MaxDownloader")
+CONTACT = os.environ.get("CONTACT_EMAIL", "your-email@example.com")
+
+FAQ = [
+    ("Is MaxDownloader free to use?",
+     "Yes. You don't need an account, and there are no watermarks or sign-up steps. Paste a link, choose a format and download."),
+    ("How do I download a YouTube video?",
+     "Copy the video link from YouTube, paste it into the box at the top of this page, press Get video, choose MP4 or MP3, then press Download."),
+    ("Which formats and qualities are available?",
+     "Video is saved as MP4, in every quality the video offers from 144p up to 4K. Audio-only downloads are saved as MP3. For MP4 files that play on every device, choose 1080p or lower."),
+    ("Do I need to install any app or extension?",
+     "No. MaxDownloader runs in your browser on Windows, Mac, Android, iPhone and Linux."),
+    ("Is it legal to download YouTube videos?",
+     "It depends on the video and where you live. Download only videos you own, videos with a Creative Commons or public-domain licence, or videos you have permission to save. YouTube's terms of service restrict other downloads."),
+    ("Why is my download taking a while?",
+     "Our server fetches the file first and then sends it to you, so long or high-quality videos take longer. Choosing a lower quality such as 480p makes it faster."),
+    ("Can I download playlists or live streams?",
+     "Not at the moment. MaxDownloader handles one regular video at a time."),
+]
+
+PAGES = [
+    dict(path="/youtube-video-downloader", fmt="mp4", nav="YouTube",
+         title="MaxDownloader: Free YouTube Video Downloader (MP4 & MP3)",
+         h1="Free YouTube Video Downloader",
+         desc="Download YouTube videos as MP4 or MP3 for free with MaxDownloader. No sign-up, no software to install. Paste a link, pick a quality and save.",
+         lede="Paste a YouTube link, choose MP4 video or MP3 audio, and download. Free, fast and no sign-up.",
+         intro="MaxDownloader is a simple online tool for saving videos you are allowed to keep, such as your own uploads, Creative Commons videos and public-domain clips. It works in any modern browser, so there is nothing to install."),
+    dict(path="/youtube-to-mp4", fmt="mp4", nav="YouTube to MP4",
+         title="YouTube to MP4 Downloader (HD & 4K) | MaxDownloader",
+         h1="YouTube to MP4 Downloader",
+         desc="Convert and download YouTube videos to MP4 in HD, Full HD or 4K with MaxDownloader. Free, no registration, works on phone and PC.",
+         lede="Save a YouTube video as an MP4 file in the quality you choose, from 144p up to 4K.",
+         intro="MP4 is the most widely supported video format, so files saved here open on phones, tablets, laptops and TVs. Pick 1080p or lower for the best compatibility, or a higher quality if your player supports it."),
+    dict(path="/youtube-to-mp3", fmt="mp3", nav="YouTube to MP3",
+         title="YouTube to MP3 Converter: Free & Fast | MaxDownloader",
+         h1="YouTube to MP3 Converter",
+         desc="Convert YouTube videos to MP3 audio for free. MaxDownloader saves the sound as a 192 kbps MP3 file. No sign-up and no app needed.",
+         lede="Turn a YouTube video into an MP3 audio file. Ideal for lectures, podcasts and your own music.",
+         intro="Need only the sound? This converter extracts the audio from the video and saves it as a 192 kbps MP3 you can play anywhere. Only convert audio you have the right to keep."),
+]
+
+PAGES.append(dict(
+    path="/pindownloader", kind="pin", nav="Pinterest Downloader",
+    title="Pinterest Video & Image Downloader: Free, HD | MaxDownloader",
+    desc="Download Pinterest videos, images and GIFs in original quality for free. Paste a pin link (pin.it works too) and save. No sign-up, no watermark.",
+    h1="Pinterest Video & Image Downloader",
+    lede="Paste a Pinterest link and get the full-size photo, video or GIF. Not the thumbnail.",
+    intro="Pinterest doesn't give you a download button for most pins. Paste the pin's link here and we fetch the original file for you: the largest version of a photo, the MP4 of a video, or the actual .gif of an animated pin.",
+))
+PAGES.append(dict(
+    path="/pinterest-gif-downloader", kind="pin", nav="Pinterest GIF",
+    title="Pinterest GIF Downloader: Save GIFs for Free | MaxDownloader",
+    desc="Download GIFs from Pinterest as real .gif files for free. Paste a pin link, press Download. No sign-up, no app, works on phone and PC.",
+    h1="Pinterest GIF Downloader",
+    lede="Save an animated pin as a real .gif file you can send, upload or keep.",
+    intro="When a pin is an animated GIF, this page downloads the original .gif file, not a still image or a screen recording. If the pin is a normal photo or video, you'll get that instead and it will be labelled so you know.",
+))
+for _pg in PAGES:
+    _pg["title"] = _pg["title"].replace("MaxDownloader", SITE_NAME)
+
+IG_PAGES = [
+    dict(path="/instagram-downloader", nav="Instagram Downloader", ph="Paste Instagram link or @username here",
+         title="Instagram Downloader: Reels, Photos, DP | MaxDownloader",
+         h1="Instagram Downloader",
+         desc="Download Instagram reels, videos, photos and profile pictures (DP) for free. Paste a public link or username. No sign-up, no app.",
+         lede="Paste a public reel, photo or story link, or just a username to get the profile picture.",
+         intro="Works with public posts, stories and profiles. Paste a post or reel link to download the video or photos, paste a story link to save that account's active stories, or type a username to get the profile picture in the largest size Instagram offers."),
+    dict(path="/instagram-reels-downloader", nav=None, ph="Paste Instagram reel link here",
+         title="Instagram Reels Downloader: Save as MP4 | MaxDownloader",
+         h1="Instagram Reels Downloader",
+         desc="Download Instagram reels as MP4 video for free. Paste the reel link and save it. No watermark overlay, no sign-up.",
+         lede="Copy a reel's link, paste it here and save the video as an MP4 file.",
+         intro="Open the reel in Instagram, tap Share, then Copy link. Paste it above and we fetch the video file for you. Only public reels work."),
+    dict(path="/instagram-photo-downloader", nav=None, ph="Paste Instagram photo link here",
+         title="Instagram Photo Downloader: Full Size | MaxDownloader",
+         h1="Instagram Photo Downloader",
+         desc="Download Instagram photos and carousel images in full size for free. Paste a public post link and save each picture.",
+         lede="Paste a public photo post and save the picture in full size.",
+         intro="For posts with several photos, each picture appears as its own card with a Download button. Only public posts work."),
+    dict(path="/instagram-story-downloader", nav=None, ph="Paste story link or @username here", mode="story",
+         title="Instagram Story Downloader: Photo & Video | MaxDownloader",
+         h1="Instagram Story Downloader",
+         desc="Download Instagram stories (photos and videos) from public accounts for free. Type a username or paste a story link.",
+         lede="Type a username or paste a story link to save the account's active stories.",
+         intro="Stories disappear after 24 hours, so save them while they're live. Every active story from a public account shows up as its own card: photos as JPG and videos as MP4. Stories from private accounts can't be downloaded."),
+    dict(path="/instagram-dp-downloader", nav=None, ph="Paste @username or profile link here",
+         title="Instagram DP Downloader: Save Profile Pic | MaxDownloader",
+         h1="Instagram DP Downloader",
+         desc="Download an Instagram profile picture (DP) in full size for free. Type a username or paste a profile link.",
+         lede="Type a username or paste a profile link to save the profile picture in the biggest size available.",
+         intro="Profile pictures are public, so this works for most accounts. You'll get the largest version Instagram serves, which is usually 320 pixels or bigger."),
+]
+for _g in IG_PAGES:
+    _g["kind"] = "ig"
+    _g["title"] = _g["title"].replace("MaxDownloader", SITE_NAME)
+PAGES.extend(IG_PAGES)
+
+IG_FAQ = [
+    ("Can I download Instagram reels, photos and profile pictures?",
+     "Yes, as long as they are public. Paste a reel or post link, or type a username for the profile picture."),
+    ("Can I download from a private account?",
+     "No. Private accounts and their posts can't be downloaded."),
+    ("Can I download Instagram stories?",
+     "Yes, active stories from public accounts. Open the Story Downloader, type the username or paste a story link, and each story appears as its own card. Stories disappear after 24 hours, and highlights aren't supported yet."),
+    ("Will the person know I viewed their story?",
+     "Stories are fetched through an account used by this site, so that account may appear in the story's viewer list. Your own account is never involved."),
+    ("Why does it say Instagram wants a login?",
+     "Instagram often asks servers to log in before showing a post. Wait a minute and try again, or try a different link."),
+    ("What size is the profile picture?",
+     "We fetch the largest version Instagram makes available for that account."),
+    ("Is it okay to reuse what I download?",
+     "Photos and videos belong to their creators. Save them for personal use, and get permission and give credit before sharing or posting someone else's work."),
+]
+
+PIN_FAQ = [
+    ("Can I download a GIF from Pinterest?",
+     "Yes. Paste the link of the animated pin and press Find media. If the pin is a GIF it is labelled GIF and downloads as a .gif file."),
+    ("How do I download a Pinterest video or image?",
+     "Open the pin, copy its link (or the pin.it short link), paste it into the box on this page and press Find media. Then press Download on the result."),
+    ("Do you save the original quality?",
+     "Yes. For photos we fetch the largest version available, and for video pins we fetch the best MP4 we can find, not the thumbnail."),
+    ("Can I download several pins at once?",
+     "Yes. Paste up to 20 links, one per line or all together, and each one gets its own Download button."),
+    ("Does it work with pin.it links?",
+     "Yes. Short pin.it links from the Pinterest app's Share button are supported."),
+    ("Can I download private pins or boards?",
+     "No. Only public individual pins work. Whole boards and private content are not supported."),
+    ("Is it okay to reuse downloaded pins?",
+     "Pins belong to their creators. Save them for personal reference, and always get permission and give credit before sharing or publishing someone else's work."),
+]
+
+LEGAL = {
+    "privacy": ("Privacy Policy", """<p>MaxDownloader does not require an account and does not ask for your name or email.</p>
+<h2>What we process</h2><p>When you paste a link, our server contacts YouTube to read the video details and, if you download, to fetch the file. The file is kept only for the few moments it takes to send it to your browser, then deleted. We do not keep copies of videos.</p>
+<h2>Logs</h2><p>Like most websites, our hosting provider may record technical data such as IP address, browser type and requested page for security and troubleshooting.</p>
+<h2>Cookies and third parties</h2><p>We do not set our own tracking cookies. Fonts are loaded from Google Fonts, which may receive your IP address. This site shows advertising from third-party ad networks (currently HilltopAds). These providers may use cookies or similar technologies to show and measure ads. Their use of data is covered by their own privacy policies.</p>
+<h2>Contact</h2><p>Questions about privacy: <a href="mailto:{contact}">{contact}</a>.</p>"""),
+    "terms": ("Terms of Use", """<p>By using MaxDownloader you agree to these terms.</p>
+<h2>Permitted use</h2><p>The service is for personal, lawful use. You may download only content you own, content under a licence that allows it (such as Creative Commons or public domain), or content you have permission to save.</p>
+<h2>Your responsibility</h2><p>You are responsible for complying with copyright law and the terms of the platform the content comes from. MaxDownloader does not host any videos and is not affiliated with or endorsed by YouTube or Google.</p>
+<h2>No warranty</h2><p>The service is provided "as is" without warranties. It may change or be unavailable at any time, and we are not liable for any loss arising from its use.</p>
+<h2>Contact</h2><p><a href="mailto:{contact}">{contact}</a></p>"""),
+    "dmca": ("Copyright / DMCA", """<p>MaxDownloader does not store or host any video or audio. Files are fetched on request from the original platform and deleted after delivery.</p>
+<p>If you are a copyright owner and believe the service is being used to infringe your work, email <a href="mailto:{contact}">{contact}</a> with: the link to the content, proof that you own the rights, your contact details, and a statement that you are acting in good faith. We will review the request promptly and can block the specific content from being processed.</p>"""),
+    "contact": ("Contact Us", """<p>Questions, feedback or a copyright request? Email us at <a href="mailto:{contact}">{contact}</a>.</p><p>We usually reply within a few days.</p>"""),
+}
+
+
+def site_url() -> str:
+    return (os.environ.get("SITE_URL") or request.url_root).rstrip("/")
+
+
+def tool_ld(page: dict, canonical: str, faq) -> str:
+    """JSON-LD for a tool page: the app itself, its FAQ and the breadcrumb trail."""
+    base = site_url()
+    group = TOOL_META.get(page["path"], ("", ""))[0]
+    crumbs = [("Home", base + "/")]
+    if group:
+        home_path = next((h for n, h, _i, _t in PLATFORMS if n == group), page["path"])
+        crumbs.append((PLATFORM_LABEL.get(group, group), base + home_path))
+    crumbs.append((page["h1"], canonical))
+    seen, items = set(), []
+    for name, url in crumbs:          # skip a level that points to the same page (e.g. the platform's main tool)
+        if url in seen:
+            continue
+        seen.add(url)
+        items.append({"@type": "ListItem", "position": len(items) + 1, "name": name, "item": url})
+    ld = {"@context": "https://schema.org", "@graph": [
+        {"@type": "WebApplication", "name": f"{SITE_NAME} {page['h1']}", "url": canonical,
+         "applicationCategory": "MultimediaApplication", "operatingSystem": "Any", "inLanguage": "en",
+         "isAccessibleForFree": True, "description": page["desc"],
+         "image": f"{base}/static/og-image.png",
+         "publisher": {"@type": "Organization", "name": SITE_NAME, "url": base + "/"},
+         "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}},
+        {"@type": "FAQPage", "mainEntity": [
+            {"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}} for q, a in faq]},
+        {"@type": "BreadcrumbList", "itemListElement": items}]}
+    return json.dumps(ld).replace("</", "<\\/")
+
+
+def make_tool_view(page):
+    def view():
+        canonical = site_url() + page["path"]
+        faq = page.get("faq", FAQ)
+        return render_template("index.html", page=page, faq=faq, pages=PAGES, canonical=canonical,
+                               title=page["title"], desc=page["desc"], jsonld=tool_ld(page, canonical, faq))
+    view.__name__ = "tool_" + (page["path"].strip("/").replace("-", "_").replace("/", "_") or "home")
+    return view
+
+
+LEGAL_DESC = {
+    "privacy": "How {site} handles your links, files and data. No accounts, no tracking cookies, and files are deleted right after they are sent to you.",
+    "terms": "Terms of use for {site}: use the tools only with content you own or have permission to save. No warranty is given.",
+    "dmca": "Copyright and DMCA information for {site}. Rights holders can contact us to report content and ask us to block it.",
+    "contact": "Contact {site} with questions, feedback or a copyright request. We usually reply within a few days.",
+}
+
+
+def make_legal_view(slug, title, body):
+    def view():
+        return render_template("legal.html", pages=PAGES, heading=title, body=body.format(contact=CONTACT),
+                               canonical=f"{site_url()}/{slug}", title=f"{title} | {SITE_NAME}",
+                               desc=LEGAL_DESC[slug].format(site=SITE_NAME))
+    view.__name__ = "legal_" + slug
+    return view
+
+
+for _p in [x for x in PAGES if not x.get("kind")]:
+    app.add_url_rule(_p["path"], view_func=make_tool_view(_p))
+for _slug, (_t, _b) in LEGAL.items():
+    app.add_url_rule(f"/{_slug}", view_func=make_legal_view(_slug, _t, _b))
+
+
+@app.get("/robots.txt")
+def robots():
+    body = (f"User-agent: *\nAllow: /\nDisallow: /api/\nDisallow: /download\nDisallow: /pin/download\nDisallow: /ig/\n"
+            f"Disallow: /x/download\nDisallow: /x/preview\n\nSitemap: {site_url()}/sitemap.xml\n")
+    return Response(body, mimetype="text/plain")
+
+
+@app.get("/sitemap.xml")
+def sitemap():
+    base = site_url()
+    rows = [("/", SITE_UPDATED)] + [(p["path"], SITE_UPDATED) for p in PAGES] + [("/guides", SITE_UPDATED)]
+    rows += [(f"/guides/{g['slug']}", g.get("date", GUIDES_UPDATED)) for g in GUIDES]
+    rows += [(f"/{s}", LEGAL_UPDATED) for s in LEGAL]
+    xml = ('<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+           + "".join(f"<url><loc>{base}{path}</loc><lastmod>{day}</lastmod></url>" for path, day in rows) + "</urlset>")
+    return Response(xml, mimetype="application/xml")
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return send_from_directory(os.path.join(app.root_path, "static"), "favicon-48.png", mimetype="image/png")
+
+
+@app.before_request
+def one_canonical_host():
+    """Send www.* and the *.onrender.com address to the main domain, so Google sees one site, not copies."""
+    wanted = os.environ.get("SITE_URL", "").rstrip("/")
+    if not wanted or request.method not in ("GET", "HEAD") or request.path == "/healthz":
+        return None
+    main_host = urlparse(wanted).netloc.lower()
+    host = request.host.lower().split(":")[0]
+    if host != main_host and (host == "www." + main_host or host.endswith(".onrender.com")):
+        target = wanted + request.full_path.rstrip("?")
+        return redirect(target, code=301)
+    return None
+
+
+TOOL_META = {
+    "/youtube-video-downloader": ("YouTube", "YouTube Video Downloader"),
+    "/youtube-to-mp4": ("YouTube", "YouTube to MP4"),
+    "/youtube-to-mp3": ("YouTube", "YouTube to MP3"),
+    "/pindownloader": ("Pinterest", "Video & Image Downloader"),
+    "/pinterest-gif-downloader": ("Pinterest", "GIF Downloader"),
+    "/instagram-downloader": ("Instagram", "Instagram Downloader"),
+    "/instagram-reels-downloader": ("Instagram", "Reels Downloader"),
+    "/instagram-photo-downloader": ("Instagram", "Photo Downloader"),
+    "/instagram-story-downloader": ("Instagram", "Story Downloader"),
+    "/instagram-dp-downloader": ("Instagram", "DP Downloader"),
+    "/twitter-video-downloader": ("Twitter", "Video Downloader"),
+    "/twitter-photo-downloader": ("Twitter", "Photo Downloader"),
+    "/twitter-gif-downloader": ("Twitter", "GIF Downloader"),
+}
+
+TOOL_GUIDES = {
+    "/youtube-video-downloader": ["how-to-download-youtube-videos", "how-to-convert-youtube-to-mp3", "is-it-legal-to-download-videos"],
+    "/youtube-to-mp4": ["how-to-download-youtube-videos", "is-it-legal-to-download-videos"],
+    "/youtube-to-mp3": ["how-to-convert-youtube-to-mp3", "is-it-legal-to-download-videos"],
+    "/pindownloader": ["how-to-download-pinterest-videos", "how-to-download-pinterest-gifs"],
+    "/pinterest-gif-downloader": ["how-to-download-pinterest-gifs", "how-to-download-pinterest-videos"],
+    "/instagram-downloader": ["how-to-download-instagram-reels", "how-to-download-instagram-profile-picture", "how-to-download-instagram-stories"],
+    "/instagram-reels-downloader": ["how-to-download-instagram-reels", "how-to-download-instagram-reels-on-iphone"],
+    "/instagram-photo-downloader": ["how-to-download-instagram-photos", "how-to-download-instagram-profile-picture"],
+    "/instagram-story-downloader": ["how-to-download-instagram-stories", "is-it-legal-to-download-videos"],
+    "/instagram-dp-downloader": ["how-to-download-instagram-profile-picture", "how-to-download-instagram-photos"],
+    "/twitter-video-downloader": ["how-to-download-twitter-videos", "how-to-save-twitter-photos-and-gifs"],
+    "/twitter-photo-downloader": ["how-to-save-twitter-photos-and-gifs", "how-to-download-twitter-videos"],
+    "/twitter-gif-downloader": ["how-to-save-twitter-photos-and-gifs", "how-to-download-twitter-videos"],
+}
+
+# ---- design data: icons, platform tabs, default steps, feature list ----
+ICONS = {
+    "play": '<circle cx="12" cy="12" r="9"/><path d="m10 8.5 5.5 3.5-5.5 3.5z"/>',
+    "camera": '<rect x="3" y="3" width="18" height="18" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1"/>',
+    "pin": '<path d="M12 21s7-6.2 7-11.5A7 7 0 0 0 5 9.5C5 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/>',
+    "xmark": '<path d="M5 4l14 16M19 4 5 20"/>',
+    "film": '<rect x="4" y="3" width="16" height="18" rx="3"/><path d="M4 8h16M4 16h16M9 3v5M15 3v5M9 16v5M15 16v5"/>',
+    "music": '<path d="M9 18V6l10-2v12"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="16.5" cy="16" r="2.5"/>',
+    "image": '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="m4 18 5-5 4 4 3-3 4 4"/>',
+    "story": '<circle cx="12" cy="12" r="9" stroke-dasharray="3.2 3"/><circle cx="12" cy="12" r="4"/>',
+    "user": '<circle cx="12" cy="8" r="4"/><path d="M4 20c1.5-4 5-5 8-5s6.5 1 8 5"/>',
+    "loop": '<path d="m17 2 4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15"/><path d="m7 22-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/>',
+    "layers": '<path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5"/>',
+    "download": '<path d="M12 4v11"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/>',
+    "bolt": '<path d="M13 2 4 14h7l-1 8 9-12h-7z"/>',
+    "hd": '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9v6M11 9v6M7 12h4M15 9h2a2 2 0 0 1 0 6h-2z"/>',
+    "shield": '<path d="M12 3 5 6v6c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6z"/><path d="m9 12 2 2 4-4"/>',
+    "phone": '<rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/>',
+    "check": '<path d="m5 12 5 5 9-10"/>',
+    "arrow": '<path d="M5 12h14"/><path d="m13 6 6 6-6 6"/>',
+}
+PLATFORMS = [  # name, home page, icon, one-line description
+    ("YouTube", "/youtube-video-downloader", "play", "Save videos as MP4 or audio as MP3."),
+    ("Instagram", "/instagram-downloader", "camera", "Reels, photos, stories and profile pictures."),
+    ("Pinterest", "/pindownloader", "pin", "Videos, images and GIFs from pins."),
+    ("Twitter", "/twitter-video-downloader", "xmark", "Videos, photos and GIFs from tweets."),
+]
+PLATFORM_LABEL = {"Twitter": "X (Twitter)"}
+PILLS = {  # tab label and icon for each tool page
+    "/youtube-video-downloader": ("Video", "play"), "/youtube-to-mp4": ("MP4", "film"), "/youtube-to-mp3": ("MP3", "music"),
+    "/pindownloader": ("Video & Image", "pin"), "/pinterest-gif-downloader": ("GIF", "loop"),
+    "/instagram-downloader": ("All-in-one", "layers"), "/instagram-reels-downloader": ("Reels", "film"),
+    "/instagram-photo-downloader": ("Photo", "image"), "/instagram-story-downloader": ("Story", "story"),
+    "/instagram-dp-downloader": ("Profile photo", "user"),
+    "/twitter-video-downloader": ("Video", "play"), "/twitter-photo-downloader": ("Photo", "image"), "/twitter-gif-downloader": ("GIF", "loop"),
+}
+GROUP_STEPS = {
+    "YouTube": [("Copy the video link", "In YouTube, press Share and copy the link, or copy the address from your browser."),
+                ("Paste it and pick a format", "Paste the link, press Get video, then choose an MP4 quality or MP3."),
+                ("Download", "Press Download. Lower qualities are ready sooner.")],
+    "Instagram": [("Copy the link", "Press Share on a Reel, photo or story and choose Copy link. For a profile picture, copy the profile link or just the username."),
+                  ("Paste it", "Paste it in the box and press Get media. Each photo or video appears as its own card."),
+                  ("Download", "Press Download on a card. Photos save as JPG and videos as MP4.")],
+    "Pinterest": [("Copy the pin's link", "Open the pin, press Share and copy the link. pin.it short links work too."),
+                  ("Paste it", "Paste one or more links and press Find media. You can add up to 20 at a time."),
+                  ("Download", "Videos save as MP4, photos in a large size and GIFs as .gif files.")],
+    "Twitter": [("Copy the tweet link", "On X, press Share under the tweet and choose Copy link. In a browser, copy the address."),
+                ("Paste it", "Press Get media. Each video, photo or GIF in the tweet appears as its own card."),
+                ("Download", "Videos and GIFs save as MP4. Photos save in their original size.")],
+}
+FEATURES = [
+    ("layers", "All content types", "Videos, Reels, photos, stories, profile pictures, GIFs and MP3 from YouTube, Instagram, Pinterest and X, in one place."),
+    ("bolt", "Simple and quick", "Paste a link and get your file. No sign-up and nothing to install."),
+    ("hd", "Original quality", "We fetch the best quality the source provides, not a reduced copy."),
+    ("shield", "Private", "No login and no sign-up. Files are deleted right after they are sent to you."),
+    ("phone", "Works on any device", "Use it on a phone, tablet or computer, in any modern browser."),
+    ("check", "Clean and clear", "No fake buttons or pop-ups. Just the tool."),
+]
+REDIRECTS = {  # retired addresses -> current ones (301)
+    "/hi/instagram-reel-download": "/instagram-reels-downloader", "/hi/instagram-dp-download": "/instagram-dp-downloader",
+    "/hi/instagram-story-download": "/instagram-story-downloader", "/hi/youtube-video-download": "/youtube-video-downloader",
+    "/hi/youtube-to-mp3": "/youtube-to-mp3", "/hi/pinterest-video-download": "/pindownloader",
+    "/hi/twitter-video-download": "/twitter-video-downloader",
+}
+REDIRECTS.update({f"/guides/{old}": f"/guides/{new}" for old, new in OLD_SLUGS.items()})
+
+
+def tool_groups():
+    groups: dict[str, dict] = {}
+    for pg in PAGES:
+        meta = TOOL_META.get(pg["path"])
+        if not meta:
+            continue
+        g = groups.setdefault(meta[0], {"name": meta[0], "home": pg["path"], "tools": [],
+                                        "top": meta[0] in ("YouTube", "Pinterest", "Instagram", "Twitter")})
+        g["tools"].append((pg["path"], meta[1]))
+    out = list(groups.values())
+    out.append({"name": "Guides", "home": "/guides", "top": True,
+                "tools": [("/guides", "All guides")] + [(f"/guides/{g['slug']}", g["h1"]) for g in GUIDES[:5]]})
+    return out
+
+
+def _crumbs_for(path, group, by_path):
+    """Visible breadcrumb trail for tool pages: Home > Platform > This tool."""
+    if not group or path not in by_path:
+        return []
+    home_path = next((h for n, h, _i, _t in PLATFORMS if n == group), path)
+    trail = [("Home", "/")]
+    if home_path != path:
+        trail.append((PLATFORM_LABEL.get(group, group), home_path))
+    trail.append((by_path[path]["h1"], None))
+    return trail
+
+
+@app.context_processor
+def inject_site():
+    path = request.path
+    meta = TOOL_META.get(path)
+    group = meta[0] if meta else ""
+    by_path = {p["path"]: p for p in PAGES}
+    if path == "/":
+        pills = [dict(label=PLATFORM_LABEL.get(n, n), path=h, icon=i, active=False) for n, h, i, _ in PLATFORMS]
+    elif group:
+        pills = [dict(label=PILLS[p][0], path=p, icon=PILLS[p][1], active=(p == path))
+                 for p, (g, _) in TOOL_META.items() if g == group and p in PILLS]
+    else:
+        pills = []
+    siblings = [dict(path=p, title=by_path[p]["h1"], text=by_path[p].get("lede", ""), icon=PILLS.get(p, ("", "download"))[1])
+                for p, (g, _) in TOOL_META.items() if group and g == group and p != path and p in by_path]
+    others = [dict(name=PLATFORM_LABEL.get(n, n), path=h, icon=i, text=t) for n, h, i, t in PLATFORMS if n != group]
+    return {"site_name": SITE_NAME, "tool_groups": tool_groups(), "site_base": site_url(), "icons": ICONS,
+            "related_guides": [BY_SLUG[s] for s in TOOL_GUIDES.get(path, []) if s in BY_SLUG],
+            "platform": group.lower(), "pills": pills, "siblings": siblings, "other_platforms": others,
+            "group_steps": GROUP_STEPS.get(group, []), "features": FEATURES,
+            "nav_platforms": [(PLATFORM_LABEL.get(n, n), h) for n, h, _i, _t in PLATFORMS],
+            "adsense_client": os.environ.get("ADSENSE_CLIENT", ""), "adsense_slot": os.environ.get("ADSENSE_SLOT", ""),
+            "page_extra": PAGE_EXTRA.get(path), "yt_paused": YT_PAUSED, "yt_paused_msg": YT_PAUSED_MSG,
+            "crumbs": _crumbs_for(path, group, by_path)}
+
+
+@app.get("/google6f0c92908fcd9963.html")
+def google_site_verification():
+    """Google Search Console ownership file. Keep this route; removing it un-verifies the site."""
+    return Response("google-site-verification: google6f0c92908fcd9963.html", mimetype="text/html")
+
+
+_health_cache: dict[str, tuple[float, bool, str]] = {}
+
+
+def _health_youtube():
+    if YT_PAUSED:
+        return True, "paused on purpose (YT_PAUSED is on), YouTube is not being contacted"
+    cap = YtLog()
+    try:
+        with yt_dlp.YoutubeDL({**base_opts(), "skip_download": True, "no_warnings": False, "logger": cap}) as ydl:
+            data = ydl.extract_info("https://www.youtube.com/watch?v=jNQXAC9IVRw", download=False)
+        return bool(data and data.get("id")), ("working" if COOKIES else "working (but no cookies file is loaded)")
+    except yt_dlp.utils.DownloadError as exc:
+        return False, (str(friendly(exc))[:160] + " || yt-dlp log: " + cap.text(700)
+                       + f" || cookies loaded: {bool(COOKIES)}")
+    except Exception as exc:  # noqa: BLE001
+        return False, repr(exc)[:140]
+
+
+def _health_instagram():
+    st = ig._cookie_status()
+    if not st["has_sessionid"]:
+        return False, "no Instagram sessionid cookie is loaded"
+    status, data = ig._api_get("https://www.instagram.com/api/v1/users/web_profile_info/", {"username": "instagram"},
+                               extra={"referer": "https://www.instagram.com/instagram/"}, web=True)
+    ok = status == 200 and bool((((data or {}).get("data") or {}).get("user")))
+    return ok, "working" if ok else f"Instagram answered HTTP {status}; the cookies probably expired"
+
+
+def _health_pinterest():
+    """Is Pinterest answering this server? Checks the page and the JSON endpoint separately."""
+    try:
+        page = requests.get("https://www.pinterest.com/", headers=core.HEADERS, timeout=15)
+        api = requests.get("https://www.pinterest.com/resource/PinResource/get/",
+                           params={"source_url": "/pin/1/", "data": '{"options":{"id":"1"},"context":{}}'},
+                           headers={**core.HEADERS, "X-Requested-With": "XMLHttpRequest"}, timeout=15)
+    except requests.RequestException as exc:
+        return False, f"could not reach Pinterest: {exc.__class__.__name__}"
+    blocked = lambda r: r.status_code in (403, 429)
+    detail = f"page HTTP {page.status_code}, JSON endpoint HTTP {api.status_code}"
+    if blocked(page):
+        return False, detail + ". Pinterest is blocking this server's IP address"
+    return page.ok, detail + (". JSON endpoint is blocked, the page method still works" if blocked(api) else "")
+
+
+def _health_twitter():
+    try:
+        data = xc._fetch_tweet("20")  # the very first tweet ever posted
+        return bool(data), "working"
+    except xc.XError as exc:
+        return False, str(exc)[:140]
+    except Exception as exc:  # noqa: BLE001
+        return False, repr(exc)[:140]
+
+
+@app.get("/api/cookie-check")
+def cookie_check():
+    """For UptimeRobot: answers 200 while the cookies work and 503 when they need replacing."""
+    key = os.environ.get("HEALTH_KEY")
+    if not key or request.args.get("key") != key:
+        return jsonify(error="Not found."), 404
+    checks = {"youtube": _health_youtube, "instagram": _health_instagram,
+              "pinterest": _health_pinterest, "twitter": _health_twitter}
+    only = request.args.get("only")
+    if only in checks:
+        names = [only]
+    elif request.args.get("all"):
+        names = list(checks)                   # ?all=1 tests every downloader
+    else:
+        names = ["youtube", "instagram"]       # default: what the uptime monitor has always watched
+    results = {}
+    for name in names:
+        hit = _health_cache.get(name)
+        ttl = 600 if hit and hit[1] else 120  # re-check a failure sooner, so a fix shows up quickly
+        if request.args.get("fresh") or not hit or time.time() - hit[0] > ttl:
+            ok, detail = checks[name]()
+            hit = (time.time(), ok, detail)
+            _health_cache[name] = hit
+        results[name] = {"ok": hit[1], "detail": hit[2], "checked_seconds_ago": int(time.time() - hit[0])}
+    ok = all(r["ok"] for r in results.values())
+    versions = {"yt_dlp": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
+                "js_runtimes_found": [n for n in ("deno", "node", "bun") if shutil.which(n)] or "none"}
+    return jsonify(ok=ok, versions=versions, **results), (200 if ok else 503)
+
+
+@app.get("/healthz")
+def healthz():
+    return "ok"
+
+
+@app.post("/api/info")
+def api_info():
+    if YT_PAUSED:
+        return jsonify(error=YT_PAUSED_MSG), 503
+    try:
+        url = clean_url((request.get_json(silent=True) or {}).get("url", ""))
+        data = _cached_info(_video_id_from_url(url) or "")
+        if data is None:
+            cap = YtLog()
+            with yt_dlp.YoutubeDL({**base_opts(), "skip_download": True, "no_warnings": False, "logger": cap}) as ydl:
+                data = ydl.extract_info(url, download=False)
+    except YTError as exc:
+        return jsonify(error=str(exc)), exc.status
+    except yt_dlp.utils.DownloadError as exc:
+        err = friendly(exc)
+        app.logger.warning("YouTube lookup failed for %s. yt-dlp said: %s", url, cap.text(1500))
+        msg = str(err)
+        if os.environ.get("YT_DEBUG"):
+            msg += " || DEBUG: " + cap.text(600)
+        return jsonify(error=msg), err.status
+    except Exception:  # noqa: BLE001
+        app.logger.exception("info failed")
+        return jsonify(error="Something went wrong looking up this video."), 500
+
+    if not data or not VIDEO_ID.fullmatch(data.get("id") or ""):
+        return jsonify(error="That link doesn't point to a single video."), 400
+    if data.get("is_live"):
+        return jsonify(error="Live streams can't be downloaded."), 400
+    if (data.get("duration") or 0) > MAX_SECONDS:
+        return jsonify(error=f"Videos longer than {MAX_SECONDS // 3600} hours aren't supported."), 400
+
+    _cache_info(data)
+    top = max((f.get("height") or 0 for f in data.get("formats", [])
+               if f.get("vcodec") not in (None, "none")), default=0)
+    heights = [h for h in STANDARD_HEIGHTS if h <= top] or [top or 720]
+    return jsonify(id=data["id"], title=data.get("title") or data["id"],
+                   channel=data.get("uploader") or "", duration=data.get("duration") or 0,
+                   thumbnail=data.get("thumbnail"), heights=heights)
+
+
+@app.get("/download")
+def download():
+    if YT_PAUSED:
+        return jsonify(error=YT_PAUSED_MSG), 503
+    vid = request.args.get("id", "")
+    fmt = request.args.get("fmt", "mp4")
+    height = request.args.get("height", type=int) or 720
+    if not VIDEO_ID.fullmatch(vid) or fmt not in ("mp4", "mp3") or not 100 <= height <= 4320:
+        return jsonify(error="Bad request."), 400
+
+    if not _dl_slots.acquire(timeout=QUEUE_WAIT):
+        return jsonify(error="The server is busy with other downloads. Please try again in a minute."), 503
+    t_start = time.time()
+    tmp = tempfile.mkdtemp(prefix="ytsaver_")
+    ff = ffmpeg_path()
+    opts = {**base_opts(), "outtmpl": os.path.join(tmp, "%(id)s.%(ext)s"),
+            "concurrent_fragment_downloads": 4, "http_chunk_size": 10 * 1024 * 1024,
+            "match_filter": yt_dlp.utils.match_filter_func(f"duration <= {MAX_SECONDS} & !is_live")}
+    if ff:
+        opts["ffmpeg_location"] = ff
+    if fmt == "mp3":
+        if ff:
+            opts["format"] = "bestaudio/best"
+            opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+        else:
+            opts["format"] = "bestaudio[ext=m4a]/bestaudio"
+    elif ff and height <= 360:
+        # 360p exists as one ready-made file (video+audio), so there is nothing to merge: the fastest option.
+        opts["format"] = (f"best[height<={height}][ext=mp4][acodec!=none][vcodec^=avc1]/"
+                          f"bestvideo[height<={height}][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<={height}]/best")
+        opts["merge_output_format"] = "mp4"
+    elif ff:
+        # Prefer H.264 + AAC: plays everywhere (VP9/AV1 in MP4 often won't play on Windows).
+        opts["format"] = (f"bestvideo[height<={height}][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                          f"best[height<={height}][vcodec^=avc1][ext=mp4]/"
+                          f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                          f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best")
+        opts["merge_output_format"] = "mp4"
+    else:
+        opts["format"] = f"best[height<={height}][ext=mp4]/best[height<={height}]/best"
+
+    def media_files():
+        return [f for f in glob.glob(os.path.join(tmp, f"{vid}.*")) if not f.endswith((".part", ".ytdl"))]
+
+    try:
+        info, how = None, "fresh"
+        cached = _cached_info(vid)
+        if cached is not None:  # skip the slow YouTube lookup we already did
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.process_ie_result(copy.deepcopy(cached), download=True)
+                if info and media_files():
+                    how = "reused-lookup"
+                else:
+                    info = None
+            except Exception:  # noqa: BLE001
+                app.logger.warning("YT %s: reusing the lookup failed, doing a fresh one", vid)
+                info = None
+            if info is None:
+                for leftover in glob.glob(os.path.join(tmp, "*")):
+                    try:
+                        os.remove(leftover)
+                    except OSError:
+                        pass
+        if info is None:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=True)
+        files = media_files()
+        app.logger.warning("YT %s %s %sp: %s, %.1fs", vid, fmt, height, how, time.time() - t_start)
+        if not info or not files:
+            raise YTError("This video can't be downloaded (live, too long, or restricted).")
+        path = max(files, key=os.path.getsize)
+    except YTError as exc:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return jsonify(error=str(exc)), exc.status
+    except yt_dlp.utils.DownloadError as exc:
+        shutil.rmtree(tmp, ignore_errors=True)
+        err = friendly(exc)
+        return jsonify(error=str(err)), err.status
+    except Exception:  # noqa: BLE001
+        shutil.rmtree(tmp, ignore_errors=True)
+        app.logger.exception("download failed")
+        return jsonify(error="Something went wrong downloading this video."), 500
+    finally:
+        _dl_slots.release()
+
+    ext = os.path.splitext(path)[1]
+    title = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", info.get("title") or vid).strip()[:100] or vid
+
+    def stream_then_clean_up():
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(1 << 16):
+                    yield chunk
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    resp = Response(stream_then_clean_up(),
+                    mimetype="audio/mpeg" if ext == ".mp3" else "video/mp4" if ext == ".mp4" else "application/octet-stream")
+    resp.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(title + ext)}; filename=\"{vid}{ext}\""
+    resp.headers["Content-Length"] = str(os.path.getsize(path))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# ---------------- Pinterest downloader (/pindownloader) ----------------
+MAX_LINKS_PER_REQUEST = 20
+
+
+def pin_lookup_one(raw: str) -> dict:
+    raw = raw.strip()
+    try:
+        info = core.get_pin_info(raw)
+    except core.PinError as exc:
+        return {"input": raw, "ok": False, "error": str(exc)}
+    except Exception:  # noqa: BLE001
+        app.logger.exception("Pin lookup failed for %s", raw)
+        return {"input": raw, "ok": False, "error": "Something went wrong looking up this pin."}
+    return {"input": raw, "ok": True, **info.public()}
+
+
+def make_pin_view(page):
+    def view():
+        canonical = site_url() + page["path"]
+        faq = page.get("faq", PIN_FAQ)
+        return render_template("pin.html", page=page, pages=PAGES, faq=faq, canonical=canonical,
+                               title=page["title"], desc=page["desc"], jsonld=tool_ld(page, canonical, faq))
+    view.__name__ = "pin_" + page["path"].strip("/").replace("-", "_").replace("/", "_")
+    return view
+
+
+for _p in [x for x in PAGES if x.get("kind") == "pin"]:
+    app.add_url_rule(_p["path"], view_func=make_pin_view(_p))
+
+
+@app.post("/api/pin/lookup")
+def pin_lookup():
+    payload = request.get_json(silent=True) or {}
+    links = [x for x in (payload.get("urls") or []) if isinstance(x, str) and x.strip()]
+    if not links:
+        return jsonify(error="Paste at least one pin link."), 400
+    if len(links) > MAX_LINKS_PER_REQUEST:
+        return jsonify(error=f"Please paste {MAX_LINKS_PER_REQUEST} links or fewer at a time."), 400
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(pin_lookup_one, links))
+    return jsonify(results=results)
+
+
+@app.get("/pin/download")
+def pin_download():
+    raw = request.args.get("url", "")
+    tmp_dir = tempfile.mkdtemp(prefix="pinsaver_")
+    try:
+        info = core.get_pin_info(raw)
+        path = core.download_media(info, tmp_dir)
+    except core.PinError as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return jsonify(error=str(exc)), exc.status
+    except Exception:  # noqa: BLE001
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        app.logger.exception("Pin download failed for %s", raw)
+        return jsonify(error="Something went wrong downloading this pin."), 500
+
+    filename = os.path.basename(path)
+
+    def stream_then_clean_up():
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(1 << 16):
+                    yield chunk
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    resp = Response(stream_then_clean_up(), mimetype=mimetypes.guess_type(filename)[0] or "application/octet-stream")
+    resp.headers.add("Content-Disposition", "attachment", filename=filename)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Content-Length"] = str(os.path.getsize(path))
+    return resp
+
+
+# ---------------- Instagram downloader ----------------
+def make_ig_view(page):
+    def view():
+        canonical = site_url() + page["path"]
+        faq = page.get("faq", IG_FAQ)
+        return render_template("ig.html", page=page, pages=PAGES, faq=faq, canonical=canonical,
+                               title=page["title"], desc=page["desc"], jsonld=tool_ld(page, canonical, faq))
+    view.__name__ = "ig_" + page["path"].strip("/").replace("-", "_").replace("/", "_")
+    return view
+
+
+for _p in IG_PAGES:
+    app.add_url_rule(_p["path"], view_func=make_ig_view(_p))
+
+
+@app.post("/api/ig/lookup")
+def ig_lookup():
+    raw = (request.get_json(silent=True) or {}).get("url", "")
+    try:
+        return jsonify(ig.resolve(raw, (request.get_json(silent=True) or {}).get("mode", "auto")).public())
+    except ig.IGError as exc:
+        return jsonify(error=str(exc)), exc.status
+    except Exception:  # noqa: BLE001
+        app.logger.exception("IG lookup failed for %s", raw)
+        return jsonify(error="Something went wrong looking this up."), 500
+
+
+@app.get("/api/ig/debug")
+def ig_debug():
+    key = os.environ.get("IG_DEBUG_KEY")
+    if not key or request.args.get("key") != key:
+        return jsonify(error="Not found."), 404
+    try:
+        return jsonify(ig.debug_report(request.args.get("u", "")))
+    except ig.IGError as exc:
+        return jsonify(error=str(exc)), 400
+
+
+@app.get("/ig/preview")
+def ig_preview():
+    raw = request.args.get("u", "")
+    index = request.args.get("i", type=int, default=0)
+    try:
+        data, ctype = ig.fetch_preview(ig.resolve(raw, request.args.get("mode", "auto")), index)
+    except ig.IGError as exc:
+        return jsonify(error=str(exc)), exc.status
+    except Exception:  # noqa: BLE001
+        app.logger.exception("IG preview failed for %s", raw)
+        return jsonify(error="Preview failed."), 500
+    resp = Response(data, mimetype=ctype)
+    resp.headers["Cache-Control"] = "private, max-age=600"
+    return resp
+
+
+@app.get("/ig/download")
+def ig_download():
+    raw = request.args.get("u", "")
+    index = request.args.get("i", type=int, default=0)
+    tmp_dir = tempfile.mkdtemp(prefix="igsaver_")
+    try:
+        path = ig.download_item(ig.resolve(raw, request.args.get("mode", "auto")), index, tmp_dir)
+    except ig.IGError as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return jsonify(error=str(exc)), exc.status
+    except Exception:  # noqa: BLE001
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        app.logger.exception("IG download failed for %s", raw)
+        return jsonify(error="Something went wrong downloading this file."), 500
+
+    filename = os.path.basename(path)
+
+    def stream_then_clean_up():
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(1 << 16):
+                    yield chunk
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    resp = Response(stream_then_clean_up(), mimetype=mimetypes.guess_type(filename)[0] or "application/octet-stream")
+    resp.headers.add("Content-Disposition", "attachment", filename=filename)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Content-Length"] = str(os.path.getsize(path))
+    return resp
+
+
+@app.errorhandler(404)
+def not_found(_exc):
+    if request.path.startswith(("/api/", "/ig/", "/pin/", "/x/", "/download")):
+        return jsonify(error="Not found."), 404
+    return render_template("404.html", pages=PAGES, canonical=site_url() + "/", title=f"Page not found | {SITE_NAME}",
+                           desc="This page doesn't exist.", robots="noindex, follow"), 404
+
+
+@app.errorhandler(Exception)
+def handle_any(exc):
+    from werkzeug.exceptions import HTTPException
+    if isinstance(exc, HTTPException):
+        return exc
+    app.logger.exception("Unhandled error")
+    if request.path.startswith(("/api/", "/ig/", "/pin/", "/download")):
+        return jsonify(error="Something went wrong on the server. Please try again."), 500
+    return "Server error", 500
+
+
+# ---------------- Twitter / X downloader ----------------
+X_FAQ = [
+    ("Can I download videos, photos and GIFs from X (Twitter)?",
+     "Yes, from public tweets. Paste the tweet's link, choose what you want, and download. No login or app is needed."),
+    ("Why can't I download some tweets?",
+     "Tweets from protected accounts, deleted tweets and tweets marked as sensitive aren't available. A tweet with only text has nothing to download."),
+    ("Are GIFs saved as GIF files?",
+     "X stores GIFs as short looping MP4 videos, so they download as MP4. They loop in most players and apps."),
+    ("Which video quality will I get?",
+     "The best one by default. If the tweet has several sizes, you can pick another from the list on the result card."),
+    ("Is it okay to reuse what I download?",
+     "Tweets belong to their creators. Save them for personal use, and get permission and give credit before sharing or posting someone else's work."),
+]
+
+X_PAGES = [
+    dict(path="/twitter-video-downloader", nav=None, ph="Paste the tweet link here",
+         title="Twitter Video Downloader: Save X Videos | MaxDownloader",
+         desc="Download videos from Twitter (X) for free. Paste the tweet link and save the video as MP4 in the quality you choose. No login, no app.",
+         h1="Twitter Video Downloader", lede="Paste a tweet link and save its video as an MP4 file.",
+         intro="Open the tweet, copy its link from the browser or the Share button, and paste it above. If the tweet has more than one video size, you can choose the quality. Photos and GIFs in the same tweet show up as their own cards."),
+    dict(path="/twitter-photo-downloader", nav=None, ph="Paste the tweet link here",
+         title="Twitter Photo Downloader: Full Size Images | MaxDownloader",
+         desc="Download photos from Twitter (X) in full size for free. Paste the tweet link and save every picture in the tweet. No login, no app.",
+         h1="Twitter Photo Downloader", lede="Save the pictures in a tweet in their original size.",
+         intro="Paste the link of a tweet with photos. Each picture appears as its own card with its size, and downloads as the original file, not the smaller preview shown on X."),
+    dict(path="/twitter-gif-downloader", nav=None, ph="Paste the tweet link here",
+         title="Twitter GIF Downloader: Save GIFs as MP4 | MaxDownloader",
+         desc="Download GIFs from Twitter (X) for free. Paste the tweet link and save the GIF as a looping MP4 file. No login, no app.",
+         h1="Twitter GIF Downloader", lede="Save a GIF from a tweet as a looping MP4 file.",
+         intro="X stores GIFs as tiny looping videos, so that is what you get: an MP4 that plays on a loop in most apps and players. Paste the tweet's link and the GIF appears with a GIF label."),
+]
+for _x in X_PAGES:
+    _x["kind"] = "x"
+    _x["title"] = _x["title"].replace("MaxDownloader", SITE_NAME)
+    PAGES.append(_x)
+
+
+def make_x_view(page):
+    def view():
+        canonical = site_url() + page["path"]
+        faq = page.get("faq", X_FAQ)
+        return render_template("x.html", page=page, faq=faq, pages=PAGES, canonical=canonical, title=page["title"],
+                               desc=page["desc"], jsonld=tool_ld(page, canonical, faq))
+    view.__name__ = "x_" + page["path"].strip("/").replace("-", "_").replace("/", "_")
+    return view
+
+
+for _x in X_PAGES:
+    app.add_url_rule(_x["path"], view_func=make_x_view(_x))
+
+# Every tool page gets its own extra questions first, then the shared ones for its platform.
+_SHARED_FAQ = {None: FAQ, "pin": PIN_FAQ, "ig": IG_FAQ, "x": X_FAQ}
+for _pg in PAGES:
+    _extra = PAGE_EXTRA.get(_pg["path"])
+    if _extra and "faq" not in _pg:
+        _pg["faq"] = list(_extra.get("faq", [])) + list(_SHARED_FAQ[_pg.get("kind")])
+
+
+@app.post("/api/x/lookup")
+def x_lookup():
+    raw = (request.get_json(silent=True) or {}).get("url", "")
+    try:
+        return jsonify(xc.resolve(raw).public())
+    except xc.XError as exc:
+        return jsonify(error=str(exc)), exc.status
+    except Exception:  # noqa: BLE001
+        app.logger.exception("X lookup failed for %s", raw)
+        return jsonify(error="Something went wrong looking this up."), 500
+
+
+@app.get("/x/preview")
+def x_preview():
+    raw = request.args.get("u", "")
+    index = request.args.get("i", type=int, default=0)
+    try:
+        data, ctype = xc.fetch_preview(xc.resolve(raw), index)
+    except xc.XError as exc:
+        return jsonify(error=str(exc)), exc.status
+    except Exception:  # noqa: BLE001
+        app.logger.exception("X preview failed for %s", raw)
+        return jsonify(error="Preview failed."), 500
+    resp = Response(data, mimetype=ctype)
+    resp.headers["Cache-Control"] = "private, max-age=600"
+    return resp
+
+
+@app.get("/x/download")
+def x_download():
+    raw = request.args.get("u", "")
+    index = request.args.get("i", type=int, default=0)
+    variant = request.args.get("v", type=int, default=0)
+    if not _dl_slots.acquire(timeout=QUEUE_WAIT):
+        return jsonify(error="The server is busy with other downloads. Please try again in a minute."), 503
+    tmp_dir = tempfile.mkdtemp(prefix="xsaver_")
+    try:
+        path = xc.download_item(xc.resolve(raw), index, variant, tmp_dir)
+    except xc.XError as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return jsonify(error=str(exc)), exc.status
+    except Exception:  # noqa: BLE001
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        app.logger.exception("X download failed for %s", raw)
+        return jsonify(error="Something went wrong downloading this file."), 500
+    finally:
+        _dl_slots.release()
+    filename = os.path.basename(path)
+
+    def stream_then_clean_up():
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(1 << 16):
+                    yield chunk
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    resp = Response(stream_then_clean_up(), mimetype=mimetypes.guess_type(filename)[0] or "application/octet-stream")
+    resp.headers.add("Content-Disposition", "attachment", filename=filename)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Content-Length"] = str(os.path.getsize(path))
+    return resp
+
+
+# ---------------- Home page (hub with every tool) ----------------
+HOME_FAQ = [
+    ("What can I download with " + SITE_NAME + "?",
+     "YouTube videos (MP4) and audio (MP3), Instagram Reels, photos, stories and profile pictures, Pinterest videos, images and GIFs, and Twitter (X) videos, photos and GIFs."),
+    ("Do I need to log in or install an app?", "No. Paste a link in your browser, on a phone or a computer. There is no sign-up."),
+    ("Is it free?", "Yes. All tools are free to use."),
+    ("Is it private?", "We don't ask for an account. A file is held only while it is sent to you, then deleted."),
+    ("Is it legal to download videos and photos?",
+     "It depends on the content. Only download things you own or have permission to save. Our guide explains it in plain English."),
+]
+
+
+@app.get("/")
+def home():
+    base = site_url()
+    by_path = {p["path"]: p for p in PAGES}
+    groups = []
+    for name, home_path, icon, blurb in PLATFORMS:
+        tools = [dict(path=p, title=by_path[p]["h1"], text=by_path[p].get("lede", ""), icon=PILLS.get(p, ("", "download"))[1])
+                 for p, (g, _) in TOOL_META.items() if g == name and p in by_path]
+        groups.append(dict(name=PLATFORM_LABEL.get(name, name), slug=name.lower(), icon=icon, blurb=blurb, tools=tools))
+    title = f"{SITE_NAME}: Free Instagram, YouTube, Pinterest Downloader"
+    desc = "Download YouTube videos and MP3, Instagram Reels, stories and photos, Pinterest pins and Twitter (X) videos for free. Paste a link. No login, no app."
+    items = [t for g in groups for t in g["tools"]]
+    ld = {"@context": "https://schema.org", "@graph": [
+        {"@type": "WebSite", "name": SITE_NAME, "url": base + "/"},
+        {"@type": "Organization", "name": SITE_NAME, "url": base + "/", "logo": base + "/static/logo.png"},
+        {"@type": "ItemList", "itemListElement": [{"@type": "ListItem", "position": i, "name": t["title"], "url": base + t["path"]} for i, t in enumerate(items, 1)]},
+        {"@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}} for q, a in HOME_FAQ]}]}
+    return render_template("home.html", groups=groups, faq=HOME_FAQ, guides=GUIDES[:3], canonical=base + "/", home_extra=HOME_EXTRA,
+                           title=title, desc=desc, jsonld=json.dumps(ld).replace("</", "<\\/"))
+
+
+# ---------------- Guides (blog) ----------------
+def _short_title(text: str) -> str:
+    full = f"{text} | {SITE_NAME}"
+    return full if len(full) <= 60 else text
+
+
+@app.get("/guides")
+def guides_index():
+    canonical = site_url() + "/guides"
+    title = _short_title("Guides: How to Download Videos and Photos")
+    desc = "Step-by-step guides for downloading Instagram Reels, stories and photos, YouTube videos, Pinterest pins and Twitter (X) videos. Free, on phone and PC."
+    ld = {"@context": "https://schema.org", "@type": "CollectionPage", "name": title, "url": canonical, "description": desc}
+    return render_template("guides_index.html", guides=GUIDES, pages=PAGES, canonical=canonical,
+                           title=title, desc=desc, jsonld=json.dumps(ld).replace("</", "<\\/"))
+
+
+@app.get("/guides/<slug>")
+def guide_page(slug):
+    g = BY_SLUG.get(slug)
+    if not g:
+        return render_template("legal.html", pages=PAGES, heading="Page not found",
+                               body="<p>This page doesn't exist. See all <a href='/guides'>guides</a>.</p>",
+                               canonical=site_url() + "/guides", title="Not found", desc="Not found.", robots="noindex, follow"), 404
+    base = site_url()
+    canonical = f"{base}/guides/{slug}"
+    ld = {"@context": "https://schema.org", "@graph": [
+        {"@type": "Article", "headline": g["h1"], "description": g["desc"], "inLanguage": "en",
+         "datePublished": g.get("date", GUIDES_UPDATED), "dateModified": g.get("date", GUIDES_UPDATED), "mainEntityOfPage": canonical,
+         "image": f"{base}/static/og-image.png",
+         "author": {"@type": "Organization", "name": SITE_NAME}, "publisher": {"@type": "Organization", "name": SITE_NAME}},
+        {"@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": q,
+                                             "acceptedAnswer": {"@type": "Answer", "text": a}} for q, a in g["faq"]]},
+        {"@type": "BreadcrumbList", "itemListElement": [
+            {"@type": "ListItem", "position": 1, "name": "Home", "item": base + "/"},
+            {"@type": "ListItem", "position": 2, "name": "Guides", "item": base + "/guides"},
+            {"@type": "ListItem", "position": 3, "name": g["h1"], "item": canonical}]}]}
+    return render_template("guide.html", g=g, related=[BY_SLUG[s] for s in g["related"] if s in BY_SLUG], pages=PAGES,
+                           canonical=canonical, title=_short_title(g["title"]), desc=g["desc"],
+                           updated=g.get("date", GUIDES_UPDATED), jsonld=json.dumps(ld).replace("</", "<\\/"))
+
+
+
+# ---------------- retired addresses (301) ----------------
+def _redirector(target):
+    return lambda: redirect(target, code=301)
+
+
+for _n, (_src, _dst) in enumerate(REDIRECTS.items()):
+    app.add_url_rule(_src, endpoint=f"retired_{_n}", view_func=_redirector(_dst))
+
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "5000"))
+    if not os.environ.get("NO_BROWSER"):
+        threading.Timer(1.0, lambda: webbrowser.open(f"http://{host}:{port}")).start()
+    app.run(host=host, port=port, debug=False, threaded=True)
