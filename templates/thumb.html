@@ -1,0 +1,90 @@
+{% extends "tool_base.html" %}
+{% block body_attrs %} class="pin ig"{% endblock %}
+{% block form %}
+<form id="form" class="searchbar" novalidate>
+  <label for="url" class="sr-only">YouTube video link</label>
+  <input type="text" id="url" inputmode="url" placeholder="Paste a YouTube video link here" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <button type="button" id="paste" class="ghost">Paste</button>
+  <button type="submit" id="go" class="primary">Get thumbnails</button>
+</form>
+<p id="status" role="status" aria-live="polite"></p>
+{% endblock %}
+{% block results %}<section id="results" class="board" aria-label="Results"></section>{% endblock %}
+{% block tool_script %}
+<script>
+(() => {
+  const form = document.getElementById('form'), field = document.getElementById('url'), goBtn = document.getElementById('go');
+  const statusEl = document.getElementById('status'), board = document.getElementById('results');
+  function setStatus(t, err = false) { statusEl.textContent = t; statusEl.classList.toggle('is-error', err); }
+  function el(tag, props = {}, ...kids) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(props)) { if (k === 'class') n.className = v; else if (k in n) n[k] = v; else n.setAttribute(k, v); }
+    n.append(...kids); return n;
+  }
+  function parseInput(text) {
+    const m = text.match(/(?:https?:\/\/)?(?:[\w-]+\.)*(?:youtube(?:-nocookie)?\.com|youtu\.be)\/[^\s"'<>]+/i);
+    return m ? m[0] : text.trim();
+  }
+  async function readError(res, fallback) { try { return (await res.json()).error || fallback; } catch (_) { return fallback; } }
+  function filenameFrom(res, fallback) {
+    const m = (res.headers.get('Content-Disposition') || '').match(/filename="?([^";]+)"?/i);
+    return m ? m[1] : fallback;
+  }
+
+  function card(item, id, i) {
+    const print = el('div', { class: 'print' },
+      el('img', { src: item.preview, alt: `YouTube thumbnail, ${item.label}`, loading: 'lazy', referrerPolicy: 'no-referrer' }),
+      el('span', { class: 'kind' }, item.label));
+    const btn = el('button', { type: 'button', class: 'primary' }, 'Download');
+    const note = el('p', { class: 'note', hidden: true });
+    const bar = window.mdBar(btn, 'after');
+    btn.addEventListener('click', async () => {
+      btn.disabled = true; btn.textContent = 'Preparing…'; note.hidden = true; note.className = 'note'; bar.wait('Getting the image…');
+      try {
+        const res = await fetch(`/thumb/download?id=${encodeURIComponent(id)}&q=${encodeURIComponent(item.key)}`);
+        if (!res.ok) throw new Error(await readError(res, 'Download failed. Please try again.'));
+        const blob = await window.mdRead(res, (p) => { if (p !== null) bar.set(p, `Downloading ${Math.round(p * 100)}%`); });
+        bar.set(1, 'Saving the file…');
+        const a = el('a', { href: URL.createObjectURL(blob), download: filenameFrom(res, item.filename) });
+        document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 15000);
+        bar.done('Done. Check your Downloads folder.');
+        btn.textContent = 'Saved. Download again';
+      } catch (e) {
+        bar.end(); btn.textContent = 'Download'; note.hidden = false; note.textContent = e.message || 'Download failed.'; note.classList.add('is-error');
+      } finally { btn.disabled = false; }
+    });
+    const caption = el('div', { class: 'caption' }, el('p', { class: 'file' }, item.filename), btn, note,
+      el('a', { class: 'view', href: item.preview, target: '_blank', rel: 'noopener' }, 'View full size'));
+    return el('article', { class: 'card', style: `--i:${i}` }, print, caption);
+  }
+
+  const lookupBar = window.mdBar(form, 'after');
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const hop = window.mdRoute(field.value); if (hop) { location.href = hop + '?u=' + encodeURIComponent(field.value.trim()); return; }
+    const source = parseInput(field.value);
+    if (!source) { setStatus('Paste a YouTube video link first.', true); field.focus(); return; }
+    lookupBar.wait('Looking for thumbnails…');
+    goBtn.disabled = true; goBtn.textContent = 'Looking up…'; board.replaceChildren();
+    board.append(el('article', { class: 'card' }, el('div', { class: 'print' }, el('div', { class: 'skeleton' }))));
+    setStatus('Looking for thumbnails…');
+    try {
+      const res = await fetch('/api/thumb/lookup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: source }) });
+      if (!res.ok) throw new Error(await readError(res, `The server is busy or waking up (code ${res.status}). Please try again in a minute.`));
+      const data = await res.json();
+      board.replaceChildren(...data.items.map((it, i) => card(it, data.id, i)));
+      setStatus(`${data.items.length} thumbnail ${data.items.length === 1 ? 'size' : 'sizes'} found.`);
+    } catch (err) {
+      board.replaceChildren(); setStatus(err.message || "Couldn't reach the server. Check your connection and try again.", true);
+    } finally { lookupBar.end(); goBtn.disabled = false; goBtn.textContent = 'Get thumbnails'; }
+  });
+
+  document.getElementById('paste').addEventListener('click', async () => {
+    try { field.value = await navigator.clipboard.readText(); form.requestSubmit(); }
+    catch (_) { setStatus('Your browser blocked clipboard access. Paste with Ctrl+V (or long-press) instead.', true); field.focus(); }
+  });
+})();
+</script>
+<script>(() => { const pre = new URLSearchParams(location.search).get('u'); const f = document.getElementById('url');
+  if (pre && f) { f.value = pre; f.dispatchEvent(new Event('input')); document.getElementById('form').requestSubmit(); } })();</script>
+{% endblock %}

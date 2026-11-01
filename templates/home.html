@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon with context %}
+{% block content %}
+<section class="hero">
+  <div class="wrap">
+    <h1>Free Video, Reel &amp; Photo Downloader</h1>
+    <p class="lede">Paste the link, get the file. Instagram, YouTube, Pinterest, X and Facebook, on your phone or your computer.</p>
+    <form id="form" class="searchbar" novalidate>
+      <label for="url" class="sr-only">Link</label>
+      <input type="text" id="url" inputmode="url" placeholder="Paste a link from Instagram, YouTube, Pinterest, X or Facebook" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button type="button" id="paste" class="ghost">Paste</button>
+      <button type="submit" id="go" class="primary">Download</button>
+    </form>
+    <p id="status" role="status" aria-live="polite"></p>
+    <p class="fine-line">Free. No login, nothing to install. Not sure which tool you need? The list below has them all.</p>
+  </div>
+</section>
+<main class="wrap">
+  <section class="section" id="tools">
+    <h2>What you can save</h2>
+    {% for g in groups %}
+    <div class="group" id="{{ g.slug }}">
+      <h3 class="group-title">{{ g.name }}<small>{{ g.blurb }}</small></h3>
+      <div class="tiles">{% for t in g.tools %}<a class="tile" href="{{ t.path }}"><h3>{{ t.title }}</h3><p>{{ t.text }}</p></a>{% endfor %}</div>
+    </div>
+    {% endfor %}
+  </section>
+
+  <section class="section">
+    <h2>How it works</h2>
+    <ol class="step-cards">
+      <li><span><strong>Copy the link</strong>Press Share on the video, photo, Reel or tweet and choose Copy link.</span></li>
+      <li><span><strong>Paste it above</strong>We recognise the site and open the right tool for you.</span></li>
+      <li><span><strong>Download</strong>Choose the quality if there is a choice, then press Download.</span></li>
+    </ol>
+  </section>
+
+  <section class="section">
+    <h2>Good to know</h2>
+    <div class="features">{% for ic, ttl, txt in features %}<div class="feature"><h3>{{ ttl }}</h3><p>{{ txt }}</p></div>{% endfor %}</div>
+  </section>
+
+  {% if home_extra %}<section class="section about" id="about">
+    <h2>{{ home_extra.about_title }}</h2>
+    {% for para in home_extra.about %}<p>{{ para }}</p>{% endfor %}
+  </section>
+
+  <section class="section about" id="hindi" lang="hi">
+    <h2>{{ home_extra.hi_title }}</h2>
+    {% for para in home_extra.hi %}<p>{{ para }}</p>{% endfor %}
+  </section>{% endif %}
+
+  <section class="section">
+    <h2>Guides</h2>
+    <p class="sub">Step-by-step help for phone and computer.</p>
+    <div class="tiles">{% for g in guides %}<a class="tile" href="/guides/{{ g.slug }}"><h3>{{ g.h1 }}</h3><p>{{ g.lede }}</p></a>{% endfor %}</div>
+    <p style="margin-top:18px"><a href="/guides">See all guides</a></p>
+  </section>
+
+  <section class="section">
+    <h2>Frequently asked questions</h2>
+    <div class="faq">{% for q, a in faq %}<details><summary>{{ q }}</summary><p>{{ a }}</p></details>{% endfor %}</div>
+  </section>
+</main>
+{% endblock %}
+{% block scripts %}
+<script>
+(() => {
+  const form = document.getElementById('form'), field = document.getElementById('url'), statusEl = document.getElementById('status');
+  const setStatus = (t, err = false) => { statusEl.textContent = t; statusEl.classList.toggle('is-error', err); };
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const v = field.value.trim();
+    if (!v) { setStatus('Paste a link first.', true); field.focus(); return; }
+    const hop = window.mdRoute(v);
+    if (hop) { setStatus('Opening the right tool\u2026'); location.href = hop + '?u=' + encodeURIComponent(v); }
+    else setStatus('That link is not from a site we support. Paste a link from Instagram, YouTube, Pinterest, X or Facebook. For a profile picture, use the Instagram DP downloader in the list below.', true);
+  });
+  document.getElementById('paste').addEventListener('click', async () => {
+    try { field.value = await navigator.clipboard.readText(); form.requestSubmit(); }
+    catch (_) { setStatus('Your browser blocked clipboard access. Paste with Ctrl+V (or long-press) instead.', true); field.focus(); }
+  });
+})();
+</script>
+{% endblock %}

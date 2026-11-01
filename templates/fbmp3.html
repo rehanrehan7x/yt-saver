@@ -1,0 +1,98 @@
+{% extends "tool_base.html" %}
+{% block body_attrs %} class="yt"{% endblock %}
+{% block form %}
+<form id="form" class="searchbar" novalidate>
+  <label for="url" class="sr-only">Facebook video link</label>
+  <input type="text" id="url" inputmode="url" placeholder="{{ page.ph }}" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <button type="button" id="paste" class="ghost">Paste</button>
+  <button type="submit" id="go" class="primary">Get video</button>
+</form>
+<p id="status" role="status" aria-live="polite"></p>
+{% endblock %}
+{% block results %}<div id="result" aria-label="Result"></div>{% endblock %}
+{% block tool_script %}
+<script>
+(() => {
+  const form = document.getElementById('form'), field = document.getElementById('url'), goBtn = document.getElementById('go');
+  const statusEl = document.getElementById('status'), result = document.getElementById('result');
+  function setStatus(t, err = false) { statusEl.textContent = t; statusEl.classList.toggle('is-error', err); }
+  function el(tag, props = {}, ...kids) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(props)) { if (k === 'class') n.className = v; else if (k in n) n[k] = v; else n.setAttribute(k, v); }
+    n.append(...kids); return n;
+  }
+  function parseLink(text) {
+    const m = text.match(/(?:https?:\/\/)?(?:[\w-]+\.)*(?:facebook\.com|fb\.watch)\/[^\s"'<>]+/i);
+    return m ? m[0] : text.trim();
+  }
+  function fmtTime(s) { s = Math.round(s); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60; return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(x).padStart(2, '0'); }
+  async function readError(res, fallback) { try { return (await res.json()).error || fallback; } catch (_) { return fallback; } }
+  function filenameFrom(res, fallback) { const m = (res.headers.get('Content-Disposition') || '').match(/filename="?([^";]+)"?/i); return m ? m[1] : fallback; }
+
+  function card(info) {
+    const mp3Url = (inline) => `/fb/mp3?url=${encodeURIComponent(info.url)}${inline ? '&inline=1' : ''}`;
+    const note = el('p', { class: 'note', hidden: true });
+    const showError = (msg) => { note.hidden = false; note.textContent = msg; note.className = 'note is-error'; };
+    const audio = el('audio', { controls: true, preload: 'none', hidden: true });
+    const listen = el('button', { type: 'button', class: 'secondary' }, 'Listen first');
+    const listenBar = window.mdBar(listen, 'after');
+    listen.addEventListener('click', async () => {
+      listen.disabled = true; note.hidden = true; listenBar.wait('Making the preview. The server is fetching the video, so this can take a minute…');
+      try {
+        const probe = await fetch(mp3Url(true), { headers: { Range: 'bytes=0-0' } });   // starts the conversion and shows any error
+        if (!probe.ok) throw new Error(await readError(probe, 'The preview could not be made.'));
+        audio.src = mp3Url(true); audio.hidden = false; await audio.play().catch(() => {});
+        listen.textContent = 'Play again';
+      } catch (e) { showError(e.message || 'The preview could not be made.'); }
+      finally { listenBar.end(); listen.disabled = false; }
+    });
+    const btn = el('button', { type: 'button', class: 'primary' }, 'Download MP3');
+    const bar = window.mdBar(btn, 'after');
+    btn.addEventListener('click', async () => {
+      btn.disabled = true; btn.textContent = 'Preparing…'; note.hidden = true; bar.wait('The server is making your MP3…');
+      try {
+        const res = await fetch(mp3Url(false));
+        if (!res.ok) throw new Error(await readError(res, 'Download failed. Please try again.'));
+        const blob = await window.mdRead(res, (p) => { if (p !== null) { btn.textContent = `Downloading ${Math.round(p * 100)}%`; bar.set(p, `Downloading ${Math.round(p * 100)}%`); } else bar.wait('Downloading…'); });
+        bar.set(1, 'Saving the file…');
+        const a = el('a', { href: URL.createObjectURL(blob), download: filenameFrom(res, 'facebook-audio.mp3') });
+        document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 15000);
+        bar.done('Done. Check your Downloads folder.'); btn.textContent = 'Saved. Download MP3 again';
+      } catch (e) { bar.end(); btn.textContent = 'Download MP3'; showError(e.message || 'Download failed.'); }
+      finally { btn.disabled = false; }
+    });
+    const meta = [info.uploader, info.duration ? fmtTime(info.duration) : ''].filter(Boolean).join(', ');
+    const img = el('img', { src: info.thumbnail || '', alt: '', referrerPolicy: 'no-referrer' });
+    img.addEventListener('error', () => { img.style.display = 'none'; });
+    return el('article', { class: 'card' }, img,
+      el('div', {}, el('p', { class: 'title' }, info.title), el('p', { class: 'meta' }, meta), listen, audio, btn, note));
+  }
+
+  const lookupBar = window.mdBar(form, 'after');
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const hop = window.mdRoute(field.value); if (hop) { location.href = hop + '?u=' + encodeURIComponent(field.value.trim()); return; }
+    const url = parseLink(field.value);
+    if (!url) { setStatus('Paste a Facebook video link first.', true); field.focus(); return; }
+    lookupBar.wait('Looking up the video…');
+    goBtn.disabled = true; goBtn.textContent = 'Looking up…'; result.replaceChildren();
+    setStatus('Looking up the video. This can take up to a minute if the server was asleep.');
+    try {
+      const res = await fetch('/api/fb/lookup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
+      if (!res.ok) throw new Error(await readError(res, `The server is busy or waking up (code ${res.status}). Please try again in a minute.`));
+      const data = await res.json();
+      if (data.duration && data.duration > 3600) throw new Error('This video is longer than an hour, so it can not be converted to MP3 here.');
+      setStatus(''); result.append(card(data)); result.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    } catch (err) { setStatus(err.message || "Couldn't reach the server. Check your connection and try again.", true); }
+    finally { lookupBar.end(); goBtn.disabled = false; goBtn.textContent = 'Get video'; }
+  });
+
+  document.getElementById('paste').addEventListener('click', async () => {
+    try { field.value = await navigator.clipboard.readText(); form.requestSubmit(); }
+    catch (_) { setStatus('Your browser blocked clipboard access. Paste with Ctrl+V (or long-press) instead.', true); field.focus(); }
+  });
+})();
+</script>
+<script>(() => { const pre = new URLSearchParams(location.search).get('u'); const f = document.getElementById('url');
+  if (pre && f) { f.value = pre; f.dispatchEvent(new Event('input')); document.getElementById('form').requestSubmit(); } })();</script>
+{% endblock %}
