@@ -1,0 +1,99 @@
+SEO changes (29 Oct 2026)
+=========================
+New file:   seo_content.py  -> unique text, tips, extra FAQ and a Hindi section for every tool page + home.
+            Edit this file to change page copy. Change SITE_UPDATED when you change content (sitemap lastmod).
+            templates/404.html -> noindex "page not found" page.
+Changed:    app.py, templates/base.html, templates/tool_base.html, templates/home.html
+
+After deploying
+1. Render env vars: SITE_URL=https://maxdownloader.in  and  CONTACT_EMAIL=<your real email>
+   (without CONTACT_EMAIL the Contact/Privacy/DMCA pages show your-email@example.com).
+2. Search Console: open Sitemaps and submit sitemap.xml again. Then use URL Inspection > Request indexing
+   on the home page and the 4 main tool pages.
+3. Wait 2-4 weeks, then check Performance > Queries and tune titles for queries that get impressions but no clicks.
+
+Backend fixes (29 Oct 2026)
+===========================
+- instagram_core.py: a Reel / TV link no longer ends as a JPG cover picture. If a method only finds the cover,
+  the next method is tried; if none finds the video, an error is shown instead of a JPG.
+- pinterest_core.py: one quick retry on timeouts and temporary Pinterest errors. If the pin page is blocked,
+  Pinterest's JSON endpoint and yt-dlp are tried before giving up. A video pin is never saved as its cover photo.
+- app.py: /api/cookie-check can now test every downloader.
+
+Find out which downloader is failing on the live server
+  https://maxdownloader.in/api/cookie-check?key=<HEALTH_KEY>&all=1&fresh=1
+  (set the env var HEALTH_KEY on Render first, any long random text). It shows YouTube, Instagram, Pinterest and
+  Twitter separately, the reason for each failure, and the yt-dlp version. ?only=pinterest tests one.
+Common causes: Instagram/YouTube/Pinterest block cloud server IPs. See README for cookies (YT_COOKIES_FILE,
+IG_COOKIES_FILE) and the IG_PROXY option. Redeploying also installs the newest yt-dlp, which fixes many YouTube errors.
+
+YouTube fix (29 Oct 2026)
+- requirements.txt now pins yt-dlp[default]==2026.10.26 (with yt-dlp-ejs 0.8.0), the exact version that was inside
+  the working venv of the original zip. The unpinned line pulled a newer yt-dlp on every fresh install.
+- To update later: change the version number here, deploy, and test one video.
+- Local Windows: delete the venv folder once and run run.bat again, so the pinned version is installed.
+
+YouTube paused (29 Oct 2026)
+- YouTube is blocking Render's IP, so the YouTube tools show "temporarily unavailable" and make NO requests to YouTube.
+  This is the default. Instagram, Pinterest and X are not affected.
+- To turn YouTube back on: Render > Environment > add YT_PAUSED=0, then redeploy.
+
+New tools (29 Oct 2026)
+=======================
+/youtube-thumbnail-downloader   thumbnail_core.py   Uses YouTube's image server only. Works even while YouTube video downloads are paused.
+/instagram-reels-to-mp3         app.py (/ig/mp3)    Downloads the Reel, ffmpeg makes a 192 kbps MP3 (max 2 at a time).
+/instagram-highlights-downloader instagram_core.py  Needs the Instagram cookies file, like stories. Needs the highlight link, not a username.
+/facebook-video-downloader      facebook_core.py    yt-dlp, public videos only. Switch off with FB_PAUSED=1 on Render if Facebook blocks the server.
+
+Test after deploying (I could not test against the live sites)
+1. Thumbnail: paste any public YouTube link.
+2. Reels to MP3: paste a public Reel with sound, play the MP3.
+3. Highlights: open a public profile's highlight in a browser, copy the address (/stories/highlights/...), paste it.
+4. Facebook: try 2 public videos (one normal, one Reel). Check /api/cookie-check?key=<HEALTH_KEY>&only=facebook&fresh=1
+   (it only checks that Facebook answers, so always test a real video too).
+Health check for everything: /api/cookie-check?key=<HEALTH_KEY>&all=1&fresh=1
+
+Redirect loop fix (29 Oct 2026)
+- Removed the code that redirected www.* and *.onrender.com to the main domain (it could loop when a proxy or tunnel
+  sends the request with the onrender.com hostname). Duplicate-content protection stays: every page has a
+  rel=canonical tag pointing at SITE_URL, and Render redirects www to the main domain by itself.
+- Added ProxyFix for the scheme only, so canonical URLs are https even when SITE_URL is not set.
+- If ERR_TOO_MANY_REDIRECTS ever comes back and this code is deployed: check Cloudflare SSL/TLS mode (must be Full,
+  not Flexible) and the custom-domain settings on Render.
+
+New design (31 Oct 2026)
+========================
+Look: white page, one yellow paste box (taxi-board yellow), ink-black buttons, left-aligned text. Fonts: Khand (headings) and Hind (text),
+both from Google Fonts and both support Hindi. The tool list on the home page is a plain list, not cards.
+All colours and sizes are in the <style> block of templates/base.html (variables at the top: --peeli is the yellow, --ink the black).
+The logo, favicon and share image were redrawn to match. Copy for the "Good to know" list is FEATURES in app.py.
+
+Facebook / MP3 not working? Find the real reason first
+- Render > Logs: search for "Facebook: yt-dlp said" or "Facebook lookup failed". That line is the real reason.
+- Optional: set FB_DEBUG=1 on Render and the reason also appears in the error shown on the page.
+- If Facebook shows a login wall to the server: set FB_COOKIES_FILE (Render Secret File, cookies.txt of a spare Facebook account).
+- Reels to MP3 uses the same Instagram access as the Reels downloader. If Reels fail with "Instagram is limiting our server", MP3 fails too.
+- YouTube to MP3 is part of YouTube, which is paused (YT_PAUSED).
+
+Facebook share links and progress bar (31 Oct 2026)
+- Facebook share links (facebook.com/share/r/..., fb.watch) are now opened by following their redirects, one hop at a time, only on
+  Facebook addresses. Before, yt-dlp (limited to Facebook extractors) refused them with "That doesn't look like a Facebook video link".
+- Progress bar: a bar under the paste box while a link is looked up, and a bar under each Download button. It slides while the server
+  is working, and shows a real percentage while the file arrives. Code: window.mdBar / window.mdRead at the bottom of templates/base.html.
+- If the logo still looks red after updating: replace the whole static/ folder and press Ctrl+F5 (the browser caches images for a week).
+
+Facebook tools and MP3 preview (31 Oct 2026)
+- Facebook now has four tools, shown as tabs like Instagram: Video, Reels, Photo, MP3
+  (/facebook-video-downloader, /facebook-reels-downloader, /facebook-photo-downloader, /facebook-to-mp3).
+- "Listen first" audio preview on Facebook Video to MP3 and on Instagram Reels to MP3. The server makes the MP3 once (audio_cache.py,
+  kept 10 minutes) and both the preview player and the download use that same file. The player can jump around (Range requests).
+- Facebook photos: read from the public link-preview data Facebook gives its crawler (og:image). Often smaller than the original upload.
+- Facebook stories are NOT included: Facebook only shows stories to logged-in people, so there is nothing public to download.
+- Facebook MP3 is limited to videos up to one hour (MP3_MAX_SECONDS in facebook_core.py).
+
+Facebook video format and progress bar style (31 Oct 2026)
+- Facebook sends video and sound as separate streams, often VP9/AV1 with Opus. Joined into one MP4 they open in browsers but not in the
+  normal players on Windows, TVs or phones. facebook_core.ensure_playable() now checks the finished file and, if it is not H.264 + AAC
+  (8-bit), converts it with ffmpeg (fast when only the sound needs converting). yt-dlp is also told to prefer H.264 + AAC first.
+  A file that already plays everywhere is not touched.
+- Progress bar: yellow and black moving stripes. Colours and speed are in the .bar rules in templates/base.html.
