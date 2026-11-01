@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+<main class="wrap narrow prose">
+  <h1>Page not found</h1>
+  <p class="lede">This page doesn't exist or has moved. Try one of the tools below, or go back to the home page.</p>
+  <p><a class="btn" href="/">Go to the home page</a></p>
+  <h2>Popular tools</h2>
+  <ul class="plain">{% for label, path in nav_platforms %}<li><a href="{{ path }}">{{ label }} downloader</a></li>{% endfor %}<li><a href="/guides">All guides</a></li></ul>
+</main>
+{% endblock %}
